@@ -1,7 +1,7 @@
 
-# hawkeye-lite — Real-time multi-camera tennis tracking (student MAANG demo)
+# hawkeye-lite — Real-time multi-camera tennis tracking 
 
-A reproducible, interview-grade implementation of the core ideas behind Hawk-Eye: camera calibration,
+The core ideas behind Hawk-Eye: camera calibration,
 deterministic per-camera detection, multi-view triangulation, physics-aware tracking, and line-calling —
 built for clarity, testability, and real-time reasoning on consumer hardware.
 
