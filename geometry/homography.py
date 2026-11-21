@@ -189,10 +189,10 @@ class CourtMapper:
             raise ValueError(msg)
         ordered = self._order_points(arr)
         self.court_points_image = ordered
-        mat = cv2.getPerspectiveTransform(ordered, self.court_corners_map)
-        self.transformation_matrix = np.asarray(mat, dtype=np.float64)
-        self.inverse_transformation_matrix = np.linalg.inv(self.transformation_matrix)
-        return self.transformation_matrix
+        mat = np.asarray(cv2.getPerspectiveTransform(ordered, self.court_corners_map), dtype=np.float64)
+        self.transformation_matrix = mat
+        self.inverse_transformation_matrix = np.asarray(np.linalg.inv(mat), dtype=np.float64)
+        return mat
 
     def map_point(self, point: tuple[float, float]) -> tuple[int, int] | None:
         """Map a single image point ``(u, v)`` to top-down map pixel coordinates."""
