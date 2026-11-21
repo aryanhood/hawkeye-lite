@@ -1,9 +1,32 @@
+# Contributing to `hawkeye-lite`
 
-# Contributing
+Thank you for your interest in contributing!
 
-Contributions are welcome.
+## Development Setup
 
-- Use Python 3.10+
-- Run `pytest` before submitting PRs
-- Keep code deterministic and well-documented
-- Prefer numerical stability over clever tricks
+```bash
+uv sync
+cd web && npm install
+```
+
+## Quality Gates
+
+Every pull request must pass all Python and Web checks:
+
+```bash
+# 1. Lint & formatting
+uv run ruff check .
+uv run ruff format --check .
+
+# 2. Strict static type checking
+uv run mypy
+
+# 3. Unit, property & end-to-end video pipeline tests (>= 90% branch coverage)
+uv run pytest --cov
+
+# 4. Verify exported benchmark report & web assets are up to date
+uv run hawkeye-lite export --check
+
+# 5. Web studio checks
+cd web && npm run check
+```
