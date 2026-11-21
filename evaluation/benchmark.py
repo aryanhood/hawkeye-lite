@@ -134,7 +134,7 @@ def run_single_benchmark_case(seed: int, camera_mode: str) -> ScenarioCaseResult
 
     # Frame-0 static camera
     cam0 = build_lookat_camera(eye_world=(31.0, 5.485, 9.0), target_world=(11.5, 5.485, 0.0))
-    h0_img_to_m = np.linalg.inv(cam0.ground_homography_meters_to_image())
+    h0_img_to_m = np.asarray(np.linalg.inv(cam0.ground_homography_meters_to_image()), dtype=np.float64)
 
     # Simulate noisy 2D pixel observations across the trajectory under the selected camera mode
     n_steps = len(traj_gt)
@@ -168,7 +168,7 @@ def run_single_benchmark_case(seed: int, camera_mode: str) -> ScenarioCaseResult
                     fov_deg=36.0,
                 )
 
-        h_k_inv = np.linalg.inv(cam_k.ground_homography_meters_to_image())
+        h_k_inv = np.asarray(np.linalg.inv(cam_k.ground_homography_meters_to_image()), dtype=np.float64)
         dynamic_h_inv_list.append(h_k_inv)
 
         uv_true = cam_k.project_3d_to_2d(traj_gt[k])
