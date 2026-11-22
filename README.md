@@ -1,6 +1,16 @@
-# hawkeye-lite — Court Calibration, Multi-View 3D Triangulation & Line Calling
+# Hawk-Eye Lite — 3D Tennis Trajectory Reconstruction & Line Calling
 
-**An offline sports-vision geometry and trajectory reconstruction engine.** Combines vectorized 12-configuration monocular court calibration for broadcast `.mp4` processing with calibrated multi-view Direct Linear Transform (DLT) 3D triangulation, multi-plane KNN outlier rejection, sub-frame ballistic impact solving, uncertainty propagation, and oblique elliptical skid-footprint `IN`/`OUT` line calling.
+### Overview (What & Why)
+
+- **What it is:** A sports-vision geometry and physics engine inspired by the Hawk-Eye officiating system.
+- **Why I built it:** Many single-camera tennis projects claim to do automated line calling from a TV broadcast feed. I built this project to clearly separate what a **single broadcast camera** can actually do (court calibration, player/ball tracking, and a 2D minimap) from why **accurate `IN`/`OUT` line calling requires 2–4 calibrated cameras** to triangulate 3D depth and avoid meter-scale parallax errors.
+- **Key Result:** Tested across 300 noisy 2D-pixel scenarios, multi-camera 3D triangulation localizes ball bounces within **31.27 mm** (4 cameras) and **52.64 mm** (2 cameras), compared to **2,708 mm** error from a single camera. Modeling the ball's elliptical skid mark on impact adds **+6.61%** accuracy on tight line calls.
+
+| Input Broadcast Video (`.mp4`) | Annotated Output (`hawkeye-lite predict --minimap 1 --bounce 1`) |
+| :---: | :---: |
+| ![Input AO Rally](assets/input_ao_rally.gif) | ![Output AO Hawk-Eye](assets/output_ao_hawkeye.gif) |
+| ![Input Real Broadcast](assets/input_real_broadcast.gif) | ![Output Real Broadcast](assets/output_real_broadcast.gif) |
+| ![Input Multi-Angle](assets/input_multi_angle.gif) | ![Output Multi-Angle](assets/output_multi_angle.gif) |
 
 ---
 
@@ -12,12 +22,6 @@ A core principle of this codebase is separating what a **single broadcast camera
    - Operates on single-camera `.mp4` input via vectorized 12-configuration court homography locking (`CourtDetector`), cutaway shot gating (`ShotSegmenter`), ego-motion-compensated optic-yellow HSV/motion ball detection (`ChromaMotionBallDetector` — explicitly a classical detector, not a neural network), `SORT` player tracking, top-right minimap rendering, and a monocular court-plane (`Z = 0`) bounce replay with explicit homography-Jacobian and out-of-plane parallax uncertainty bounds (`monocular_parallax_bound_m`).
 2. **Calibrated Multi-View 3D DLT Reconstruction & Line Calling (`tracking/reconstruction.py`, `decision/line_call.py`)**
    - Given 2 to 4 calibrated camera streams `P_k(t)` (including panning/moving cameras), runs per-frame pairwise consensus DLT triangulation, rejects clutter spikes across three orthogonal 2D projections (`xy`, `xz`, `yz` KNN + temporal neighbor filtering), solves sub-frame ballistic intersection at `Z(t*) = r_ball` (`0.0335 m`), propagates combined `(J^T J)^-1` DLT + regression/timing covariance `(sigma_x_mm, sigma_y_mm)`, and evaluates the velocity-aligned elliptical skid contact patch against the 50 mm ITF line outer edge.
-
-| Input Broadcast Video (`.mp4`) | Annotated Output (`hawkeye-lite predict --minimap 1 --bounce 1`) |
-| :---: | :---: |
-| ![Input AO Rally](assets/input_ao_rally.gif) | ![Output AO Hawk-Eye](assets/output_ao_hawkeye.gif) |
-| ![Input Real Broadcast](assets/input_real_broadcast.gif) | ![Output Real Broadcast](assets/output_real_broadcast.gif) |
-| ![Input Multi-Angle](assets/input_multi_angle.gif) | ![Output Multi-Angle](assets/output_multi_angle.gif) |
 
 ---
 
