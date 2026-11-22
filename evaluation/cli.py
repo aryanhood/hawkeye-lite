@@ -1,8 +1,7 @@
-"""Command-line interface for `hawkeye-lite` v2.0.0.
+"""Command-line interface for `hawkeye-lite`.
 
 Supports:
 1. `hawkeye-lite predict --input_video_path ... --output_video_path ... --minimap 1 --bounce 1`
-   (Directly compatible with `ArtLabss/tennis-tracking/predict_video.py` flags!)
 2. `hawkeye-lite synth --scenario ao_sideline_in --output samples/input.mp4`
 3. `hawkeye-lite benchmark`
 4. `hawkeye-lite export [--check]`
@@ -26,7 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser."""
     parser = argparse.ArgumentParser(
         prog="hawkeye-lite",
-        description="Offline Monocular & Multi-Angle Video-to-Video Tennis Hawk-Eye Engine (v2.0.0)",
+        description="Tennis Court Calibration, Multi-View DLT Triangulation & Line Calling Engine",
     )
     sub = parser.add_subparsers(dest="command")
 
@@ -110,13 +109,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "benchmark":
         report = run_benchmark(num_seeds=int(args.seeds))
-        print(f"=== Hawk-Eye Lite v2.0.0 Paired Benchmark ({report.total_cases} scenarios) ===")
-        for summary in (report.static_baseline, report.artlabss_2d, report.hawkeye_3d):
+        print(f"=== Hawk-Eye Lite 2D-Pixel-Only Paired Benchmark ({report.total_cases} scenarios) ===")
+        for summary in (report.static_1cam, report.dynamic_1cam, report.dlt_2cam, report.dlt_4cam):
             print(
                 f"- {summary.name}: median={summary.bounce_error_median_mm:.2f} mm, "
                 f"p90={summary.bounce_error_p90_mm:.2f} mm, mean={summary.bounce_error_mean_mm:.2f} mm | "
                 f"Call Acc={summary.line_call_accuracy_pct:.2f}% (Tight +-35mm: {summary.tight_call_accuracy_pct:.2f}%)"
             )
+        print(
+            f"- Skid ablation (2-Cam DLT): off={report.skid_ablation_2cam_no_skid_tight_pct:.2f}% vs "
+            f"on={report.dlt_2cam.tight_call_accuracy_pct:.2f}% tight accuracy"
+        )
         return 0
 
     if args.command == "export":

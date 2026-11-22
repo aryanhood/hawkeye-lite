@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from camera.calibration import build_lookat_camera
 from decision.line_call import (
     compute_skid_footprint,
     distance_to_nearest_court_line_mm,
@@ -25,11 +26,14 @@ from tracking.reconstruction import (
     find_service,
     fit_curve_with_constraints,
     knn_filter_outliers,
-    lift_2d_trajectory_to_3d_court,
     model_curve_function,
+    monocular_parallax_bound_m,
+    project_2d_trajectory_to_court_plane,
     reconstruct_3d_trajectory_seu,
+    reconstruct_multiview_bounce,
     remove_outlier,
     simulate_aerodynamic_flight_rk4,
+    simulate_aerodynamic_rally_exact,
 )
 from tracking.sort import (
     BallKalmanTracker,
@@ -158,21 +162,38 @@ def test_seu_3d_reconstruction_knn_and_aerodynamics() -> None:
     assert len(recon_3d) >= 10
     assert len(b_fit) >= 1
 
-    # Test 2D v-cusp bounce detector and 2D->3D lifting
+    # Test 2D v-cusp bounce detector, court-plane Z=0 projection, and multiview DLT reconstruction
     coords_2d = [(400.0 + 5.0 * k, 200.0 + 12.0 * k if k <= 15 else 380.0 - 10.0 * (k - 15)) for k in range(32)]
     b_frames, lag_mat = detect_bounces_artlabss(coords_2d, fps=30.0)
     assert 15 in b_frames
     assert lag_mat.shape == (32, 60)
 
     ref = CourtReference()
-    lifted_3d = lift_2d_trajectory_to_3d_court(
+    proj_2d = project_2d_trajectory_to_court_plane(
         coords_2d=coords_2d,
         game_warp_matrices=[np.eye(3, dtype=np.float64)],
-        bounce_frames=b_frames,
         pixel_to_meters_fn=ref.pixel_to_meters,
-        fps=30.0,
     )
-    assert lifted_3d.shape == (32, 3)
+    assert proj_2d.shape == (32, 2)
+    assert monocular_parallax_bound_m(0.5, 18.0, 9.0) > 1.0
+
+    # Verify exact sub-stepped RK4 + 2-cam multiview DLT bounce localization
+    traj_ex, _, _, pos_gt, vel_gt = simulate_aerodynamic_rally_exact(
+        pos0_m=(22.0, 4.0, 1.2),
+        vel0_m_s=(-25.0, 5.0, 2.3),
+        spin_rad_s=(0.0, -240.0, 0.0),
+        num_steps=64,
+    )
+    assert pos_gt is not None
+    assert vel_gt is not None
+    c1 = build_lookat_camera(eye_world=(31.0, 5.485, 9.0), target_world=(11.5, 5.485, 0.0))
+    c2 = build_lookat_camera(eye_world=(-5.5, 11.5, 8.5), target_world=(10.5, 5.5, 0.0))
+    mv = reconstruct_multiview_bounce(
+        [c1.p_mat, c2.p_mat],
+        [c1.project_3d_to_2d(traj_ex), c2.project_3d_to_2d(traj_ex)],
+        fps=60.0,
+    )
+    assert np.hypot(mv.bounce_xy_m[0] - pos_gt[0], mv.bounce_xy_m[1] - pos_gt[1]) * 1000.0 < 35.0
 
 
 def test_decision_line_call_and_skid_footprint() -> None:
@@ -204,7 +225,7 @@ def test_decision_line_call_and_skid_footprint() -> None:
         vel_incident_m_s=(-25.0, 8.0, -7.5),
         singles=True,
         use_skid_footprint=True,
-        homography_img_to_m=np.eye(3, dtype=np.float64) * 0.01,
+        homography_img_to_m=np.diag([0.01, 0.01, 1.0]),
         bounce_uv_px=(500.0, 300.0),
     )
     assert not call_out.is_in

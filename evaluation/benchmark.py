@@ -1,18 +1,12 @@
-"""300-Scenario Paired Ablation Benchmark for `hawkeye-lite` v2.0.0.
+"""300-Scenario Honest 2D-Pixel-Only Multi-View vs. Monocular Benchmark.
 
-Evaluates three methods on the exact same pre-sampled 3D rallies across 100 deterministic
-SHA-256 seeds x 3 broadcast camera modes (`static_high`, `panning_broadcast`, `multi_angle_cut`):
-1. **Static 2D Frame-0 Homography + Raw Centroid (Legacy Prototype Baseline)**:
-   Calibrates once on Frame 0 and checks point-in-polygon without pan compensation, outlier filtering,
-   or elliptical skid footprint.
-2. **Dynamic Homography + 2D Linear Interpolation (`ArtLabss` 2D Baseline)**:
-   Tracks court homography frame-by-frame and applies 3-pass `remove_outliers` + `interpolation`,
-   but calls lines using a 0-radius center point without 3D multi-plane KNN curve constraints or
-   oblique skid footprint.
-3. **Hawk-Eye Lite v2.0.0 (Dynamic Homography + 3D KNN Constrained Curve + Oblique Skid Ellipse)**:
-   Combines dynamic per-frame calibration, multi-plane (`xy`/`xz`) KNN filtering, endpoint-constrained
-   3D curve reconstruction (`start_loss + end_loss + data_loss`), and elliptical skid footprint against
-   the 50 mm ITF line outer edge.
+All 4 methods operate strictly from independent noisy 2D pixel observations
+(sigma = 1.0 px + 6% random +/-80 px clutter spikes), with:
+- ZERO oracle 3D coordinates
+- ZERO oracle bounce frame indices
+- ZERO oracle impact velocities
+- IDENTICAL ITF skid-footprint rule across all primary comparisons
+- Separate controlled ablation isolating skid-footprint impact and uncertainty calibration
 """
 
 from __future__ import annotations
@@ -27,9 +21,10 @@ from geometry.homography import apply_homography
 from numpy.typing import NDArray
 from tracking.interpolation import diff_xy, interpolation, remove_outliers
 from tracking.reconstruction import (
-    knn_filter_outliers,
-    reconstruct_3d_trajectory_seu,
-    simulate_aerodynamic_flight_rk4,
+    detect_bounces_artlabss,
+    monocular_parallax_bound_m,
+    reconstruct_multiview_bounce,
+    simulate_aerodynamic_rally_exact,
 )
 
 
@@ -51,12 +46,19 @@ class ScenarioCaseResult:
     gt_bounce_y_m: float
     gt_is_in: bool
     gt_margin_mm: float
-    err_static_mm: float
-    err_artlabss_2d_mm: float
-    err_hawkeye_3d_mm: float
-    call_correct_static: bool
-    call_correct_artlabss_2d: bool
-    call_correct_hawkeye_3d: bool
+    err_static_1cam_mm: float
+    err_dynamic_1cam_mm: float
+    err_dlt_2cam_mm: float
+    err_dlt_4cam_mm: float
+    call_correct_static_1cam: bool
+    call_correct_dynamic_1cam: bool
+    call_correct_dlt_2cam: bool
+    call_correct_dlt_4cam: bool
+    call_correct_2cam_no_skid: bool
+    brier_2cam: float
+    brier_4cam: float
+    ci95_covered_2cam: bool
+    ci95_covered_4cam: bool
 
 
 @dataclass(frozen=True)
@@ -68,84 +70,101 @@ class MethodSummary:
     bounce_error_p90_mm: float
     bounce_error_mean_mm: float
     line_call_accuracy_pct: float
-    tight_call_accuracy_pct: float  # calls within +-35 mm of line edge
+    tight_call_accuracy_pct: float
+    brier_score: float | None = None
+    ci95_coverage_pct: float | None = None
 
 
 @dataclass(frozen=True)
 class BenchmarkReport:
-    """Full 300-scenario benchmark summary."""
+    """Full 300-scenario honest 2D-pixel-only benchmark summary."""
 
     total_cases: int
     tight_cases_count: int
-    static_baseline: MethodSummary
-    artlabss_2d: MethodSummary
-    hawkeye_3d: MethodSummary
-    mean_error_reduction_vs_static_mm: float
-    mean_error_reduction_vs_artlabss_mm: float
+    tight_in_rate_pct: float
+    static_1cam: MethodSummary
+    dynamic_1cam: MethodSummary
+    dlt_2cam: MethodSummary
+    dlt_4cam: MethodSummary
+    skid_ablation_2cam_no_skid_acc_pct: float
+    skid_ablation_2cam_no_skid_tight_pct: float
+    mean_error_reduction_2cam_vs_1cam_mm: float
+    mean_error_reduction_4cam_vs_2cam_mm: float
     cases: list[ScenarioCaseResult]
 
 
 CAMERA_MODES: tuple[str, ...] = ("static_high", "panning_broadcast", "multi_angle_cut")
 
 
-def run_single_benchmark_case(seed: int, camera_mode: str) -> ScenarioCaseResult:
-    """Execute one paired scenario comparing Static 2D, ArtLabss 2D, and Hawk-Eye Lite 3D."""
-    rng = seeded_rng("hawkeye-benchmark-v2", seed, camera_mode)
+def _estimate_monocular_bounce_idx(coords: list[tuple[float, float]]) -> int:
+    """Estimate bounce frame purely from 2D pixel vertical impulse cusp (no ground truth)."""
+    b_frames, _ = detect_bounces_artlabss(coords, fps=60.0)
+    valid = [b for b in b_frames if 4 <= b <= len(coords) - 5]
+    if valid:
+        return valid[0]
+    # Upward ground restitution produces a strong negative peak in image-v second difference d2v/dt2
+    v_vals = np.array([c[1] for c in coords], dtype=np.float64)
+    interior = np.arange(4, len(coords) - 4)
+    d2v = v_vals[interior + 2] - 2.0 * v_vals[interior] + v_vals[interior - 2]
+    return int(interior[int(np.argmin(d2v))])
 
-    # Target bounce deliberately concentrated near the right singles sideline (Y = 9.60 m)
-    # so we rigorously test tight Australian Open line calls within +-45 mm of the outer edge!
+
+def run_single_benchmark_case(seed: int, camera_mode: str) -> ScenarioCaseResult:
+    """Execute one paired scenario where all 4 methods start strictly from noisy 2D pixels."""
+    rng = seeded_rng("hawkeye-honest-v1", seed, camera_mode)
+
     right_sideline_outer_y = 9.60
     vx_aim = float(rng.uniform(-26.4, -23.6))
     vy_aim = float(rng.uniform(7.2, 8.8))
     vz_aim = float(rng.uniform(2.15, 2.55))
     topspin = float(rng.uniform(-310.0, -180.0))
 
-    traj_raw, bounce_step = simulate_aerodynamic_flight_rk4(
+    traj_raw, b_step, _, pos_b_raw, vel_inc_raw = simulate_aerodynamic_rally_exact(
         pos0_m=(22.3, 3.15, 1.15),
         vel0_m_s=(vx_aim, vy_aim, vz_aim),
         spin_rad_s=(0.0, topspin, 0.0),
         dt=1.0 / 60.0,
         num_steps=72,
     )
-    b_idx = bounce_step if bounce_step is not None else int(np.argmin(traj_raw[:, 2]))
-    b_idx = min(max(b_idx, 5), len(traj_raw) - 5)
+    b_idx_gt = b_step if b_step is not None else int(np.argmin(traj_raw[:, 2]))
+    assert pos_b_raw is not None
+    assert vel_inc_raw is not None
 
-    # Shift Y so that the true bounce center lands within [-42 mm, +28 mm] of the 9.60 m line edge
-    target_y_m = right_sideline_outer_y + float(rng.uniform(-0.042, 0.028))
+    # Center tight calls around (right_sideline_outer_y + 23mm nominal skid) so ~50% IN / ~50% OUT
+    target_y_m = right_sideline_outer_y + 0.023 + float(rng.uniform(-0.045, 0.045))
+    y_shift = target_y_m - float(pos_b_raw[1])
     traj_gt = traj_raw.copy()
-    traj_gt[:, 1] += target_y_m - float(traj_raw[b_idx, 1])
+    traj_gt[:, 1] += y_shift
 
-    gt_bx = float(traj_gt[b_idx, 0])
-    gt_by = float(traj_gt[b_idx, 1])
+    gt_bx = float(pos_b_raw[0])
+    gt_by = float(pos_b_raw[1] + y_shift)
 
-    # Ground-truth incident velocity at bounce
-    v_inc = (
-        float((traj_gt[b_idx, 0] - traj_gt[b_idx - 1, 0]) * 60.0),
-        float((traj_gt[b_idx, 1] - traj_gt[b_idx - 1, 1]) * 60.0),
-        -7.4,
-    )
     gt_decision = evaluate_line_call(
         bounce_x_m=gt_bx,
         bounce_y_m=gt_by,
-        vel_incident_m_s=v_inc,
+        vel_incident_m_s=vel_inc_raw,
         singles=True,
         use_skid_footprint=True,
     )
 
-    # Frame-0 static camera
+    # Calibrated stadium cameras
     cam0 = build_lookat_camera(eye_world=(31.0, 5.485, 9.0), target_world=(11.5, 5.485, 0.0))
-    h0_img_to_m = np.linalg.inv(cam0.ground_homography_meters_to_image())
+    cam_side = build_lookat_camera(eye_world=(-5.5, 11.5, 8.5), target_world=(10.5, 5.5, 0.0))
+    cam_far = build_lookat_camera(eye_world=(-7.0, 2.0, 9.0), target_world=(12.0, 6.0, 0.0))
+    cam_opp = build_lookat_camera(eye_world=(24.0, -4.5, 8.0), target_world=(11.5, 6.0, 0.0))
 
-    # Simulate noisy 2D pixel observations across the trajectory under the selected camera mode
+    h0_inv = np.linalg.inv(cam0.ground_homography_meters_to_image())
     n_steps = len(traj_gt)
-    noisy_coords_static: list[tuple[float, float] | list[float] | None] = []
-    noisy_coords_dynamic: list[tuple[float, float] | list[float] | None] = []
-    dynamic_h_inv_list: list[NDArray[np.float64]] = []
-    noisy_3d_samples = np.zeros_like(traj_gt)
+
+    p_cam0_seq: list[NDArray[np.float64]] = []
+    h_cam0_inv_seq: list[NDArray[np.float64]] = []
+    uv_cams: list[NDArray[np.float64]] = [np.zeros((n_steps, 2), dtype=np.float64) for _ in range(4)]
+    raw_cam0_list: list[tuple[float, float] | list[float] | None] = []
+
+    other_cams = [cam_side, cam_far, cam_opp]
 
     for k in range(n_steps):
         if camera_mode == "static_high":
-            pan_y = 0.0
             cam_k = cam0
         elif camera_mode == "panning_broadcast":
             pan_y = 0.32 * float(np.sin(2.0 * np.pi * k / n_steps))
@@ -154,9 +173,8 @@ def run_single_benchmark_case(seed: int, camera_mode: str) -> ScenarioCaseResult
                 target_world=(11.5, 5.485 + pan_y, 0.0),
             )
         else:
-            # multi_angle_cut: cuts to a baseline corner camera halfway through flight
             pan_y = 0.22 * float(np.sin(2.0 * np.pi * k / n_steps))
-            if k < b_idx - 6:
+            if k < b_idx_gt - 6:
                 cam_k = build_lookat_camera(
                     eye_world=(31.0, 5.485 + pan_y, 9.0),
                     target_world=(11.5, 5.485 + pan_y, 0.0),
@@ -168,101 +186,126 @@ def run_single_benchmark_case(seed: int, camera_mode: str) -> ScenarioCaseResult
                     fov_deg=36.0,
                 )
 
-        h_k_inv = np.linalg.inv(cam_k.ground_homography_meters_to_image())
-        dynamic_h_inv_list.append(h_k_inv)
+        p_cam0_seq.append(cam_k.p_mat)
+        h_cam0_inv_seq.append(np.linalg.inv(cam_k.ground_homography_meters_to_image()))
 
-        uv_true = cam_k.project_3d_to_2d(traj_gt[k])
-        px_noise = rng.normal(0.0, 1.35, size=2)
-        uv_obs = (float(uv_true[0] + px_noise[0]), float(uv_true[1] + px_noise[1]))
-
-        # Inject occasional spike outlier away from the 5-frame bounce window
-        if abs(k - b_idx) > 4 and k not in (0, n_steps - 1) and float(rng.random()) < 0.08:
-            uv_spike = (uv_obs[0] + float(rng.choice([-85.0, 85.0])), uv_obs[1] + float(rng.choice([-75.0, 75.0])))
-            noisy_coords_static.append([uv_spike[0], uv_spike[1]])
-            noisy_coords_dynamic.append([uv_spike[0], uv_spike[1]])
-            noisy_3d_samples[k] = traj_gt[k] + np.array([2.8, -2.5, 1.9], dtype=np.float64)
-        else:
-            noisy_coords_static.append([uv_obs[0], uv_obs[1]])
-            noisy_coords_dynamic.append([uv_obs[0], uv_obs[1]])
-            # 3D trajectory observations with realistic measurement noise
-            noisy_3d_samples[k] = np.array(
-                [
-                    float(traj_gt[k, 0] + rng.normal(0.0, 0.0085)),
-                    float(traj_gt[k, 1] + rng.normal(0.0, 0.0075)),
-                    max(0.0335, float(traj_gt[k, 2] + rng.normal(0.0, 0.011))),
-                ],
-                dtype=np.float64,
-            )
+        cams_k = [cam_k, *other_cams]
+        for c_idx, cam_obj in enumerate(cams_k):
+            uv_true = cam_obj.project_3d_to_2d(traj_gt[k])
+            uv_noisy = uv_true + rng.normal(0.0, 1.0, size=2)
+            # Independent 6% clutter spikes (including near bounce, NO oracle exclusion!)
+            if k not in (0, n_steps - 1) and float(rng.random()) < 0.06:
+                uv_noisy += np.array(
+                    [float(rng.choice([-80.0, 80.0])), float(rng.choice([-70.0, 70.0]))],
+                    dtype=np.float64,
+                )
+            uv_cams[c_idx][k] = uv_noisy
+        raw_cam0_list.append([float(uv_cams[0][k, 0]), float(uv_cams[0][k, 1])])
 
     # -----------------------------------------------------------------------
-    # Method 1: Static Frame-0 Homography + Raw 2D Centroid
+    # 1. 1-Cam Static Frame-0 Homography (no outlier removal, no dynamic H_t)
     # -----------------------------------------------------------------------
-    # Also includes 1-frame discrete sampling jitter before sub-frame interpolation
-    discrete_idx = b_idx - 1 if float(rng.random()) < 0.5 else b_idx
-    raw_disc_uv = noisy_coords_static[discrete_idx]
-    assert raw_disc_uv is not None
-    static_xy = apply_homography(h0_img_to_m, np.array([raw_disc_uv[0], raw_disc_uv[1]], dtype=np.float64))
-    err_static_mm = float(np.hypot(static_xy[0] - gt_bx, static_xy[1] - gt_by) * 1000.0)
+    b_est_static = _estimate_monocular_bounce_idx([(float(p[0]), float(p[1])) for p in uv_cams[0]])
+    uv_s = uv_cams[0][b_est_static]
+    xy_s = apply_homography(h0_inv, uv_s)
+    err_static_mm = float(np.hypot(xy_s[0] - gt_bx, xy_s[1] - gt_by) * 1000.0)
     call_static = evaluate_line_call(
-        bounce_x_m=float(static_xy[0]),
-        bounce_y_m=float(static_xy[1]),
-        vel_incident_m_s=v_inc,
-        singles=True,
-        use_skid_footprint=False,
-    )
-
-    # -----------------------------------------------------------------------
-    # Method 2: ArtLabss 2D Dynamic Homography + Outlier Removal/Interpolation (No 3D Curve / No Skid Ellipse)
-    # -----------------------------------------------------------------------
-    art_coords = list(noisy_coords_dynamic)
-    for _ in range(3):
-        xd, yd = diff_xy(art_coords)
-        remove_outliers(xd, yd, art_coords)
-    art_interp = interpolation(art_coords)
-    art_uv = art_interp[b_idx]
-    art_xy = apply_homography(dynamic_h_inv_list[b_idx], np.array([art_uv[0], art_uv[1]], dtype=np.float64))
-    # Note: At frame b_idx, the ball center is at Z = r_ball (0.0335m), whereas a pure Z=0 planar
-    # homography incurs perspective parallax dX = (Z / H_cam) * dist_to_cam (~50-75 mm) + pixel noise
-    err_art_mm = float(np.hypot(art_xy[0] - gt_bx, art_xy[1] - gt_by) * 1000.0)
-    call_art = evaluate_line_call(
-        bounce_x_m=float(art_xy[0]),
-        bounce_y_m=float(art_xy[1]),
-        vel_incident_m_s=v_inc,
-        singles=True,
-        use_skid_footprint=False,
-    )
-
-    # -----------------------------------------------------------------------
-    # Method 3: Hawk-Eye Lite v2.0.0 (Dynamic H_t + Multi-Plane KNN + Pre/Post-Bounce 3D Fit + Oblique Skid Ellipse)
-    # -----------------------------------------------------------------------
-    knn_clean = knn_filter_outliers(noisy_3d_samples, n_neighbors=4, deviation=1.1, plane="xy")
-    knn_clean = knn_filter_outliers(knn_clean, n_neighbors=4, deviation=1.0, plane="xz")
-
-    pre_idx = [idx for idx in range(max(0, b_idx - 4), b_idx + 1) if np.linalg.norm(knn_clean[idx]) > 1e-6]
-    post_idx = [idx for idx in range(b_idx, min(n_steps, b_idx + 5)) if np.linalg.norm(knn_clean[idx]) > 1e-6]
-    if len(pre_idx) >= 2 and len(post_idx) >= 2:
-        t_pre = np.array(pre_idx, dtype=np.float64) - float(b_idx)
-        t_post = np.array(post_idx, dtype=np.float64) - float(b_idx)
-        x_pre = float(np.polyval(np.polyfit(t_pre, knn_clean[pre_idx, 0], deg=1), 0.0))
-        y_pre = float(np.polyval(np.polyfit(t_pre, knn_clean[pre_idx, 1], deg=1), 0.0))
-        x_post = float(np.polyval(np.polyfit(t_post, knn_clean[post_idx, 0], deg=1), 0.0))
-        y_post = float(np.polyval(np.polyfit(t_post, knn_clean[post_idx, 1], deg=1), 0.0))
-        hawk_bx = 0.5 * (x_pre + x_post)
-        hawk_by = 0.5 * (y_pre + y_post)
-    else:
-        fitted_3d, b_fitted, _ = reconstruct_3d_trajectory_seu(noisy_3d_samples)
-        b_f = b_fitted[0] if b_fitted else int(np.argmin(fitted_3d[:, 2]))
-        hawk_bx = float(fitted_3d[b_f, 0])
-        hawk_by = float(fitted_3d[b_f, 1])
-
-    err_hawk_mm = float(np.hypot(hawk_bx - gt_bx, hawk_by - gt_by) * 1000.0)
-    call_hawk = evaluate_line_call(
-        bounce_x_m=hawk_bx,
-        bounce_y_m=hawk_by,
-        vel_incident_m_s=v_inc,
+        bounce_x_m=float(xy_s[0]),
+        bounce_y_m=float(xy_s[1]),
+        vel_incident_m_s=(-24.0, 7.5, -7.2),
         singles=True,
         use_skid_footprint=True,
+        homography_img_to_m=h0_inv,
+        bounce_uv_px=(float(uv_s[0]), float(uv_s[1])),
+        extra_sigma_mm=monocular_parallax_bound_m(0.06, 20.0, 9.0) * 1000.0,
     )
+
+    # -----------------------------------------------------------------------
+    # 2. 1-Cam Dynamic Per-Frame Homography + Outlier Removal + Interp
+    # -----------------------------------------------------------------------
+    clean_2d = list(raw_cam0_list)
+    for _ in range(3):
+        xd, yd = diff_xy(clean_2d)
+        remove_outliers(xd, yd, clean_2d)
+    interp_2d = interpolation(clean_2d)
+    b_est_dyn = _estimate_monocular_bounce_idx(interp_2d)
+    uv_d = interp_2d[b_est_dyn]
+    h_dyn = h_cam0_inv_seq[b_est_dyn]
+    xy_d = apply_homography(h_dyn, np.array([uv_d[0], uv_d[1]], dtype=np.float64))
+    prev_k = max(0, b_est_dyn - 2)
+    xy_prev = apply_homography(
+        h_cam0_inv_seq[prev_k],
+        np.array([interp_2d[prev_k][0], interp_2d[prev_k][1]], dtype=np.float64),
+    )
+    dt_2d = max(1, b_est_dyn - prev_k) / 60.0
+    vx_2d = float(xy_d[0] - xy_prev[0]) / dt_2d
+    vy_2d = float(xy_d[1] - xy_prev[1]) / dt_2d
+
+    err_dyn_mm = float(np.hypot(xy_d[0] - gt_bx, xy_d[1] - gt_by) * 1000.0)
+    call_dyn = evaluate_line_call(
+        bounce_x_m=float(xy_d[0]),
+        bounce_y_m=float(xy_d[1]),
+        vel_incident_m_s=(vx_2d, vy_2d, -7.2),
+        singles=True,
+        use_skid_footprint=True,
+        homography_img_to_m=h_dyn,
+        bounce_uv_px=(float(uv_d[0]), float(uv_d[1])),
+        extra_sigma_mm=monocular_parallax_bound_m(0.06, 20.0, 9.0) * 1000.0,
+    )
+
+    # -----------------------------------------------------------------------
+    # 3. 2-Cam Calibrated DLT 3D + KNN + Sub-Frame Ballistic Fit
+    # -----------------------------------------------------------------------
+    res2 = reconstruct_multiview_bounce(
+        [p_cam0_seq, cam_side.p_mat],
+        [uv_cams[0], uv_cams[1]],
+        fps=60.0,
+        pixel_sigma_px=1.0,
+    )
+    bx2, by2 = res2.bounce_xy_m
+    err_2cam_mm = float(np.hypot(bx2 - gt_bx, by2 - gt_by) * 1000.0)
+    call_2cam = evaluate_line_call(
+        bounce_x_m=bx2,
+        bounce_y_m=by2,
+        vel_incident_m_s=res2.vel_incident_m_s,
+        singles=True,
+        use_skid_footprint=True,
+        explicit_sigma_xy_mm=(res2.sigma_x_mm, res2.sigma_y_mm),
+    )
+    call_2cam_noskid = evaluate_line_call(
+        bounce_x_m=bx2,
+        bounce_y_m=by2,
+        vel_incident_m_s=res2.vel_incident_m_s,
+        singles=True,
+        use_skid_footprint=False,
+        explicit_sigma_xy_mm=(res2.sigma_x_mm, res2.sigma_y_mm),
+    )
+
+    # -----------------------------------------------------------------------
+    # 4. 4-Cam Stadium DLT 3D + KNN + Sub-Frame Ballistic Fit
+    # -----------------------------------------------------------------------
+    res4 = reconstruct_multiview_bounce(
+        [p_cam0_seq, cam_side.p_mat, cam_far.p_mat, cam_opp.p_mat],
+        uv_cams,
+        fps=60.0,
+        pixel_sigma_px=1.0,
+    )
+    bx4, by4 = res4.bounce_xy_m
+    err_4cam_mm = float(np.hypot(bx4 - gt_bx, by4 - gt_by) * 1000.0)
+    call_4cam = evaluate_line_call(
+        bounce_x_m=bx4,
+        bounce_y_m=by4,
+        vel_incident_m_s=res4.vel_incident_m_s,
+        singles=True,
+        use_skid_footprint=True,
+        explicit_sigma_xy_mm=(res4.sigma_x_mm, res4.sigma_y_mm),
+    )
+
+    gt_y_num = 1.0 if gt_decision.is_in else 0.0
+    brier2 = float((call_2cam.probability_in - gt_y_num) ** 2)
+    brier4 = float((call_4cam.probability_in - gt_y_num) ** 2)
+    cov2 = abs(by2 - gt_by) * 1000.0 <= 1.96 * res2.sigma_y_mm
+    cov4 = abs(by4 - gt_by) * 1000.0 <= 1.96 * res4.sigma_y_mm
 
     return ScenarioCaseResult(
         seed=seed,
@@ -271,17 +314,24 @@ def run_single_benchmark_case(seed: int, camera_mode: str) -> ScenarioCaseResult
         gt_bounce_y_m=round(gt_by, 4),
         gt_is_in=gt_decision.is_in,
         gt_margin_mm=gt_decision.margin_mm,
-        err_static_mm=round(err_static_mm, 2),
-        err_artlabss_2d_mm=round(err_art_mm, 2),
-        err_hawkeye_3d_mm=round(err_hawk_mm, 2),
-        call_correct_static=(call_static.is_in == gt_decision.is_in),
-        call_correct_artlabss_2d=(call_art.is_in == gt_decision.is_in),
-        call_correct_hawkeye_3d=(call_hawk.is_in == gt_decision.is_in),
+        err_static_1cam_mm=round(err_static_mm, 2),
+        err_dynamic_1cam_mm=round(err_dyn_mm, 2),
+        err_dlt_2cam_mm=round(err_2cam_mm, 2),
+        err_dlt_4cam_mm=round(err_4cam_mm, 2),
+        call_correct_static_1cam=(call_static.is_in == gt_decision.is_in),
+        call_correct_dynamic_1cam=(call_dyn.is_in == gt_decision.is_in),
+        call_correct_dlt_2cam=(call_2cam.is_in == gt_decision.is_in),
+        call_correct_dlt_4cam=(call_4cam.is_in == gt_decision.is_in),
+        call_correct_2cam_no_skid=(call_2cam_noskid.is_in == gt_decision.is_in),
+        brier_2cam=round(brier2, 5),
+        brier_4cam=round(brier4, 5),
+        ci95_covered_2cam=cov2,
+        ci95_covered_4cam=cov4,
     )
 
 
 def run_benchmark(num_seeds: int = 100) -> BenchmarkReport:
-    """Run the full ``num_seeds x 3 = 300`` paired scenario benchmark."""
+    """Run the full ``num_seeds x 3 = 300`` honest 2D-pixel-only paired scenario benchmark."""
     cases: list[ScenarioCaseResult] = []
     for seed in range(1, num_seeds + 1):
         for mode in CAMERA_MODES:
@@ -290,44 +340,71 @@ def run_benchmark(num_seeds: int = 100) -> BenchmarkReport:
     tight_cases = [c for c in cases if abs(c.gt_margin_mm) <= 35.0]
     n_total = max(len(cases), 1)
     n_tight = max(len(tight_cases), 1)
+    tight_in_rate = 100.0 * sum(1 for c in tight_cases if c.gt_is_in) / n_tight
 
-    def summarize(name: str, errs: list[float], correct_all: list[bool], correct_tight: list[bool]) -> MethodSummary:
+    def summarize(
+        name: str,
+        errs: list[float],
+        corr_all: list[bool],
+        corr_tight: list[bool],
+        briers: list[float] | None = None,
+        cov95: list[bool] | None = None,
+    ) -> MethodSummary:
         arr = np.asarray(errs, dtype=np.float64)
         return MethodSummary(
             name=name,
             bounce_error_median_mm=round(float(np.median(arr)), 2),
             bounce_error_p90_mm=round(float(np.percentile(arr, 90)), 2),
             bounce_error_mean_mm=round(float(np.mean(arr)), 2),
-            line_call_accuracy_pct=round(100.0 * sum(correct_all) / n_total, 2),
-            tight_call_accuracy_pct=round(100.0 * sum(correct_tight) / n_tight, 2),
+            line_call_accuracy_pct=round(100.0 * sum(corr_all) / n_total, 2),
+            tight_call_accuracy_pct=round(100.0 * sum(corr_tight) / n_tight, 2),
+            brier_score=round(float(np.mean(briers)), 4) if briers else None,
+            ci95_coverage_pct=round(100.0 * sum(cov95) / n_total, 2) if cov95 else None,
         )
 
     s_static = summarize(
-        "Static Frame-0 Homography (2D Raw Centroid)",
-        [c.err_static_mm for c in cases],
-        [c.call_correct_static for c in cases],
-        [c.call_correct_static for c in tight_cases],
+        "1-Cam Static Frame-0 Homography",
+        [c.err_static_1cam_mm for c in cases],
+        [c.call_correct_static_1cam for c in cases],
+        [c.call_correct_static_1cam for c in tight_cases],
     )
-    s_art = summarize(
-        "ArtLabss 2D Dynamic Homography + Linear Interp (No Skid Footprint)",
-        [c.err_artlabss_2d_mm for c in cases],
-        [c.call_correct_artlabss_2d for c in cases],
-        [c.call_correct_artlabss_2d for c in tight_cases],
+    s_dyn = summarize(
+        "1-Cam Dynamic Homography + 2D Outlier Interp",
+        [c.err_dynamic_1cam_mm for c in cases],
+        [c.call_correct_dynamic_1cam for c in cases],
+        [c.call_correct_dynamic_1cam for c in tight_cases],
     )
-    s_hawk = summarize(
-        "Hawk-Eye Lite v2.0 (Dynamic H_t + 3D Multi-Plane KNN + Skid Ellipse)",
-        [c.err_hawkeye_3d_mm for c in cases],
-        [c.call_correct_hawkeye_3d for c in cases],
-        [c.call_correct_hawkeye_3d for c in tight_cases],
+    s_2cam = summarize(
+        "2-Cam DLT 3D + KNN + Sub-Frame Ballistic Fit",
+        [c.err_dlt_2cam_mm for c in cases],
+        [c.call_correct_dlt_2cam for c in cases],
+        [c.call_correct_dlt_2cam for c in tight_cases],
+        [c.brier_2cam for c in cases],
+        [c.ci95_covered_2cam for c in cases],
     )
+    s_4cam = summarize(
+        "4-Cam Stadium DLT 3D + KNN + Sub-Frame Ballistic Fit",
+        [c.err_dlt_4cam_mm for c in cases],
+        [c.call_correct_dlt_4cam for c in cases],
+        [c.call_correct_dlt_4cam for c in tight_cases],
+        [c.brier_4cam for c in cases],
+        [c.ci95_covered_4cam for c in cases],
+    )
+
+    no_skid_all = round(100.0 * sum(c.call_correct_2cam_no_skid for c in cases) / n_total, 2)
+    no_skid_tight = round(100.0 * sum(c.call_correct_2cam_no_skid for c in tight_cases) / n_tight, 2)
 
     return BenchmarkReport(
         total_cases=len(cases),
         tight_cases_count=len(tight_cases),
-        static_baseline=s_static,
-        artlabss_2d=s_art,
-        hawkeye_3d=s_hawk,
-        mean_error_reduction_vs_static_mm=round(s_static.bounce_error_mean_mm - s_hawk.bounce_error_mean_mm, 2),
-        mean_error_reduction_vs_artlabss_mm=round(s_art.bounce_error_mean_mm - s_hawk.bounce_error_mean_mm, 2),
+        tight_in_rate_pct=round(tight_in_rate, 2),
+        static_1cam=s_static,
+        dynamic_1cam=s_dyn,
+        dlt_2cam=s_2cam,
+        dlt_4cam=s_4cam,
+        skid_ablation_2cam_no_skid_acc_pct=no_skid_all,
+        skid_ablation_2cam_no_skid_tight_pct=no_skid_tight,
+        mean_error_reduction_2cam_vs_1cam_mm=round(s_dyn.bounce_error_mean_mm - s_2cam.bounce_error_mean_mm, 2),
+        mean_error_reduction_4cam_vs_2cam_mm=round(s_2cam.bounce_error_mean_mm - s_4cam.bounce_error_mean_mm, 2),
         cases=cases,
     )

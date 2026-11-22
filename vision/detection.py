@@ -7,11 +7,10 @@ Adapts ``ArtLabss/tennis-tracking/detection.py`` and ``predict_video.py``:
      multi-object tracking, discriminated by cumulative movement distance ``boxes_dist``).
    - ``calculate_feet_positions``: projects player bounding-box bottom-centers ``(cx, y2)`` through
      ``game_warp_matrix`` onto the reference court canvas and smooths with ``savgol_filter(7, 2)``.
-2. ``TrackNetMotionBallDetector``:
-   - Implements the 3-frame temporal + chromatic heatmap ball detector followed by
-     ``cv2.threshold(heatmap, 127, 255)`` and ``cv2.HoughCircles`` / sub-pixel centroiding
-     (from ``predict_video.py`` lines 165-196), enhanced with inter-frame homography warping
-     to cancel camera pan motion.
+2. ``ChromaMotionBallDetector``:
+   - Implements a classical pan-compensated 2-frame motion + HSV optic-yellow ball detector
+     followed by morphological top-hat filtering and ``cv2.HoughCircles`` / contour centroiding
+     (non-neural CPU baseline).
 3. ``create_top_view_frame`` and ``merge_minimap``:
    - Renders the live 2D Top-Down Court Minimap (players in blue, ball in yellow, bounce markers
      in green/red) and composites it cleanly into the top-right corner of the video frame.
@@ -362,13 +361,12 @@ class DetectionModel:
         return arr1, arr2
 
 
-class TrackNetMotionBallDetector:
-    """3-frame ego-motion-compensated heatmap ball detector + ``cv2.HoughCircles`` centroiding.
+class ChromaMotionBallDetector:
+    """Classical ego-motion-compensated HSV + frame-difference ball detector + ``cv2.HoughCircles``.
 
-    Follows the exact heatmap -> threshold(127, 255) -> HoughCircles / blob centroid pipeline
-    of ``ArtLabss/tennis-tracking/predict_video.py`` (lines 159-196), while generating the
-    640x360 probability heatmap from pan-compensated 3-frame motion + optic-yellow/bright
-    chromatic isolation so it executes deterministically on CPU without external weights.
+    Deterministic non-neural CPU baseline combining optic-yellow HSV chromatic gating,
+    homography-stabilized 2-frame differencing, morphological top-hat filtering, and
+    ``HoughCircles`` / contour circularity scoring (no neural network weights).
     """
 
     def __init__(self) -> None:

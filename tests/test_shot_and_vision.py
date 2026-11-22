@@ -1,4 +1,4 @@
-"""Tests for CourtDetector, ShotSegmenter, DetectionModel, TrackNetMotionBallDetector, and Minimap."""
+"""Tests for CourtDetector, ShotSegmenter, DetectionModel, ChromaMotionBallDetector, and Minimap."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from camera.calibration import build_lookat_camera
 from evaluation.synthetic_video import render_court_3d_frame, render_cutaway_frame
 from vision.court_detector import CourtDetector
 from vision.detection import (
+    ChromaMotionBallDetector,
     DetectionModel,
-    TrackNetMotionBallDetector,
     area_of_box,
     boxes_dist,
     center_of_box,
@@ -95,7 +95,7 @@ def test_shot_segmenter_and_player_ball_detection_and_minimap() -> None:
 
     # Test player & ball detector and top-down minimap
     det_model = DetectionModel()
-    ball_det = TrackNetMotionBallDetector()
+    ball_det = ChromaMotionBallDetector()
 
     detector.detect(f_court_1)
     det_model.detect_player_1(f_court_1, detector)

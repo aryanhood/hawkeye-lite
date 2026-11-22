@@ -12,5 +12,5 @@ Model the ground contact patch as a rotated 2D ellipse `SkidFootprint(center_x_m
 
 ## Consequences
 
-- Eliminates systematic false-`OUT` calls on balls whose center lands `1–25 mm` outside the line edge while their physical skid footprint clips the line.
-- Improves tight line-call accuracy (within `±35 mm` of the line edge) by `>18 percentage points` over 0-radius center-point baselines in our 300-scenario paired benchmark.
+- Eliminates systematic false-`OUT` calls on balls whose center lands `1-25 mm` outside the line edge while their physical skid footprint overlaps the painted boundary.
+- Evaluated via a controlled ablation in `evaluation/benchmark.py` holding the exact same 2-camera DLT 3D coordinates fixed while toggling `use_skid_footprint` on balanced `+/-35 mm` tight calls (`~50% IN / ~50% OUT`).

@@ -1,162 +1,130 @@
-<h1 align="center">🎾 hawkeye-lite — Monocular & Multi-Angle Video-to-Video Tennis Hawk-Eye</h1>
+# hawkeye-lite — Court Calibration, Multi-View 3D Triangulation & Line Calling
 
-<p align="center">
-  <a href="https://github.com/aryanhood/hawkeye-lite/actions/workflows/ci.yml"><img src="https://github.com/aryanhood/hawkeye-lite/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue" alt="Python 3.11–3.13">
-  <img src="https://img.shields.io/badge/web-React%2019%20%2B%20TypeScript-3178c6" alt="React 19 + TypeScript">
-  <img src="https://img.shields.io/badge/license-MIT-emerald" alt="MIT License">
-</p>
-
-<p align="center">
-  <b>Video Input (<code>.mp4</code>) → <code>hawkeye-lite</code> → Video Output (<code>.mp4</code>)</b><br>
-  An offline Australian Open Electronic Line Calling (ELC) & 3D Broadcast Replay engine built for normal single-camera and multi-angle broadcast videos — no stadium 10-camera rig required.
-</p>
+**An offline sports-vision geometry and trajectory reconstruction engine.** Combines vectorized 12-configuration monocular court calibration for broadcast `.mp4` processing with calibrated multi-view Direct Linear Transform (DLT) 3D triangulation, multi-plane KNN outlier rejection, sub-frame ballistic impact solving, uncertainty propagation, and oblique elliptical skid-footprint `IN`/`OUT` line calling.
 
 ---
 
-## 1. Output Video First (`Input Video` → `Output Video`)
+## 1. Two Distinct Operating Regimes
 
-Feed any tennis video clip (`.mp4`) into `hawkeye-lite predict` and get back an annotated broadcast `.mp4` containing:
-1. **Dynamic Court Line Overlay** (12-configuration template matching + 100-sample per-line tracking across camera pan/zoom).
-2. **Player & Ball Tracking** (near/far player ROI boxes + 8-frame yellow ball comet trail).
-3. **Top-Right Dynamic 2D Court Minimap (`--minimap 1`)** (live player feet positions in blue, ball in yellow, bounce calls in green/red).
-4. **Millimeter `IN` / `OUT` Line Call + Appended 3D Hawk-Eye Challenge Replay (`--bounce 1`)** (split-screen Australian Open 3D line close-up skid mark + 3D isometric wireframe court trajectory plot).
+A core principle of this codebase is separating what a **single broadcast camera** can physically resolve from what requires **calibrated multi-view geometry**:
 
-| Input Video (`.mp4`) | Output Video (`hawkeye-lite predict --minimap 1 --bounce 1`) |
+1. **Monocular Broadcast Video Pipeline (`hawkeye-lite predict`)**
+   - Operates on single-camera `.mp4` input via vectorized 12-configuration court homography locking (`CourtDetector`), cutaway shot gating (`ShotSegmenter`), ego-motion-compensated optic-yellow HSV/motion ball detection (`ChromaMotionBallDetector` — explicitly a classical detector, not a neural network), `SORT` player tracking, top-right minimap rendering, and a monocular court-plane (`Z = 0`) bounce replay with explicit homography-Jacobian and out-of-plane parallax uncertainty bounds (`monocular_parallax_bound_m`).
+2. **Calibrated Multi-View 3D DLT Reconstruction & Line Calling (`tracking/reconstruction.py`, `decision/line_call.py`)**
+   - Given 2 to 4 calibrated camera streams `P_k(t)` (including panning/moving cameras), runs per-frame pairwise consensus DLT triangulation, rejects clutter spikes across three orthogonal 2D projections (`xy`, `xz`, `yz` KNN + temporal neighbor filtering), solves sub-frame ballistic intersection at `Z(t*) = r_ball` (`0.0335 m`), propagates combined `(J^T J)^-1` DLT + regression/timing covariance `(sigma_x_mm, sigma_y_mm)`, and evaluates the velocity-aligned elliptical skid contact patch against the 50 mm ITF line outer edge.
+
+| Input Broadcast Video (`.mp4`) | Annotated Output (`hawkeye-lite predict --minimap 1 --bounce 1`) |
 | :---: | :---: |
-| **1. Australian Open Crosscourt Forehand (Skidding on Right Singles Sideline)**<br>![Input AO Rally](assets/input_ao_rally.gif) | **Output: Court Overlay + Top-Right Minimap + `IN` Call + 3D Hawk-Eye Replay**<br>![Output AO Hawk-Eye](assets/output_ao_hawkeye.gif) |
-| **2. Real Broadcast Footage (ATP Dubai — Djokovic vs. Federer)**<br>![Input Real Broadcast](assets/input_real_broadcast.gif) | **Output: Auto-Locked Court Lines + Player Tracking + Live Top-Down Minimap**<br>![Output Real Broadcast](assets/output_real_broadcast.gif) |
-| **3. Multi-Angle Edited Broadcast Clip (Cutaway → Panning Rally Cam → Angle Cut)**<br>![Input Multi-Angle](assets/input_multi_angle.gif) | **Output: Cutaway Gated (`TRACKING PAUSED`) → Auto Re-Lock Across Camera Cut**<br>![Output Multi-Angle](assets/output_multi_angle.gif) |
-
-> **Full `.mp4` sample videos** are generated directly by `uv run hawkeye-lite synth` and `uv run hawkeye-lite predict` (see [Quick Start](#3-quick-start)).
+| ![Input AO Rally](assets/input_ao_rally.gif) | ![Output AO Hawk-Eye](assets/output_ao_hawkeye.gif) |
+| ![Input Real Broadcast](assets/input_real_broadcast.gif) | ![Output Real Broadcast](assets/output_real_broadcast.gif) |
+| ![Input Multi-Angle](assets/input_multi_angle.gif) | ![Output Multi-Angle](assets/output_multi_angle.gif) |
 
 ---
 
-## 2. How It Works (In 4 Simple Steps)
-
-Real tennis broadcast videos aren't captured from a locked tripod — camera operators pan and zoom, and broadcast directors cut between main rally cameras, low court-level angles, and crowd/player cutaways. `hawkeye-lite` solves this in four clean stages:
-
-### Step 1: 26-Point 3D World Coordinates & 12-Configuration Court Calibration (`geometry/` & `vision/court_detector.py`)
-
-We establish a metric 3D ITF court coordinate system (`23.77 m × 10.97 m` at $Z = 0$, plus `5` net-top keypoints at $X = 11.885\text{ m}, Z = 1.20\text{ m}$) and a 2D `CourtReference` template containing **12 four-point configurations (`court_conf[1..12]`)**:
+## 2. Geometry & Physics Pipeline
 
 ![Step 1: 26-Point 3D World Coordinates and 12 Court Homography Configurations](assets/step1_calibration_12configs.png)
 
-- **Why 12 configurations?** When a broadcast camera zooms or pans so only part of the court is visible (e.g., only the top service boxes or one singles sideline), `CourtDetector._find_homography` tests horizontal × vertical white-line intersections against all 12 configurations and locks the highest-scoring homography (`score = c_p - 0.5 * w_p`).
-- **150× Vectorized Speedup:** By vectorizing `_filter_pixels` with NumPy array slicing and replacing symbolic `sympy.Line` intersections with closed-form 2D cross-products, `CourtDetector` calibrates a 720p frame in **`< 8 ms` on CPU** (compared to `4.5 s` per frame / `16+ minutes` per video in unvectorized Python).
-- **Cutaway Gating & Camera-Moved Recovery (`vision/shot_segmenter.py`):** During frame-to-frame tracking (`track_court`), we sample 100 points along each active court line and refit with `cv2.fitLine`. If a hard camera cut occurs or `< 50` inlier points remain (`CAMERA ... HAS BEEN MOVED`), the tracker resets cleanly — pausing overlays during non-court cutaways (spectators/logos) and automatically re-detecting the court on the new camera angle.
-
----
-
-### Step 2: Pan-Compensated Ball Heatmap, SORT Player Tracking & Dynamic Minimap (`vision/detection.py` & `tracking/sort.py`)
-
-- **Ego-Motion-Compensated Ball Detection:** Before taking temporal frame differences, frame $t-1$ is warped into frame $t$ via the inter-frame court homography $\Delta\mathbf{H}_t = \mathbf{H}_t \mathbf{H}_{t-1}^{-1}$. This cancels background line motion caused by camera panning, isolating the fast-moving optic-yellow tennis ball for `cv2.HoughCircles` and sub-pixel centroiding, followed by a 3-pass spike filter (`diff_xy` + `remove_outliers`) and linear `interpolation`.
-- **Court-Mask Player Tracking & Top-Down Minimap:** Using warped court-half masks (`get_court_mask(1)` for bottom half, `get_court_mask(2)` for top half) and `Sort` (`KalmanBoxTracker` + Hungarian IoU assignment), we discriminate the active players from ballboys/umpires by cumulative movement distance (`boxes_dist`), project their feet positions `(cx, y2)` through `game_warp_matrix`, smooth with a Savitzky-Golay filter (`savgol_filter(7, 2)`), and render the live **Top-Right 2D Court Minimap**.
-
----
-
-### Step 3: Multi-Plane KNN Outlier Filtering & Endpoint-Constrained 3D Curve Fitting (`tracking/reconstruction.py`)
-
-Raw 3D trajectory points lifted from noisy 2D detections contain clumpy outliers clustered near the flight arc, and independent polynomial fits leave gaps between bounce segments. We shift outlier filtering to orthogonal 2D view projections (`xy` top-down, `xz` side view, `yz` end view) using K-Nearest Neighbors (`knn_filter_outliers`), segment the rally at detected events (`find_service`, `find_bounce`, `find_hit`), and fit continuous 3D curves with `scipy.optimize.minimize`:
-
-$$\mathcal{L}(\theta) = w_{\text{end}}\Big((\hat{y}_0 - y_{\text{start}})^2 + (\hat{y}_{-1} - y_{\text{end}})^2\Big) + \frac{1}{N}\sum_{i=1}^N (\hat{y}_i - y_i)^2$$
+- **Vectorized 12-Configuration Homography (`vision/court_detector.py`, `geometry/court_reference.py`):** Evaluates visible horizontal/vertical court-line intersections across 12 four-point configurations when broadcast pan/zoom crops part of the court. Vectorized pixel filtering and closed-form 2D cross-product line intersections calibrate a 720p frame in milliseconds on CPU.
+- **Consensus Multi-View DLT + 3-Plane KNN (`tracking/reconstruction.py`):** Triangulates per-frame camera subsets to reject single-camera outliers before full-set SVD triangulation, then applies orthogonal `xy`/`xz`/`yz` KNN and temporal neighbor checks to isolate true ballistic arcs from clutter spikes.
 
 ![Step 2: Raw 3D Points -> Multi-Plane KNN Filtering -> Constrained 3D Curve Reconstruction](assets/step2_knn_3d_reconstruction.png)
 
----
-
-### Step 4: Oblique Elliptical Skid Footprint vs. 50 mm ITF Line Outer Edge (`decision/line_call.py`)
-
-A real tennis ball (`radius = 33.5 mm`) striking a hardcourt at `90–150 km/h` compresses vertically and skids horizontally for `~4 ms`, leaving an **elliptical contact patch** (semi-major axis $a \approx 28\text{–}48\text{ mm}$ along the velocity vector). Under ITF rules, if even `0.1 mm` of that contact footprint touches the outer edge of the `50 mm` line, the ball is **`IN`**.
-
-### Paired Ablation Benchmark (300 Broadcast Scenarios)
-
-We evaluate three methods on the **exact same 300 pre-sampled 3D aerodynamic rallies** (`100 SHA-256 seeds × 3 camera modes`: `static_high`, `panning_broadcast`, `multi_angle_cut`). Full report: [`docs/benchmark.md`](docs/benchmark.md).
-
-| Metric | Static Frame-0 Homography (Legacy 2D) | `ArtLabss` 2D Dynamic Homography + Interp | **`hawkeye-lite` v2.0 (3D KNN + Skid Ellipse)** |
-|---|---:|---:|---:|
-| Bounce localization error — median | 165.67 mm | 89.24 mm | **7.12 mm** |
-| Bounce localization error — p90 | 4322.26 mm | 153.10 mm | **12.52 mm** |
-| Bounce localization error — mean | 1505.61 mm | 91.09 mm | **7.45 mm** |
-| Overall line-call accuracy (`N = 300`) | 76.33% | 47.00% | **96.00%** |
-| Tight line-call accuracy within `±35 mm` (`N = 171`) | 69.01% | 26.32% | **92.98%** |
+- **Sub-Frame RK4 Simulation & Skid Footprint (`decision/line_call.py`):** Aerodynamic drag + Magnus spin integration uses exact sub-stepped contact interpolation at `Z = r_ball`. At impact, an oblique elliptical contact footprint along the horizontal incident velocity direction tests minimum signed overlap against the ITF 50 mm outer line boundary, returning a calibrated Gaussian/normal-CDF `P(IN)` using the lateral uncertainty `sigma_mm`.
 
 ---
 
-## 3. Quick Start
+## 3. Honest 300-Scenario Benchmark (2D Pixel Observations Only)
 
-### Python CLI (`Video In → Video Out`)
+Every method is evaluated across **100 SHA-256 seeds × 3 camera modes** (`static_high`, `panning_broadcast`, `multi_angle_cut` — `N = 300` total rallies, `N = 242` tight calls within `+/-35 mm` balanced at `49.6%` ground-truth `IN`) operating **strictly from noisy 2D pixel coordinates** (`sigma = 1.0 px` Gaussian jitter + `6%` random `+/-80 px` clutter spikes per view). No method receives oracle 3D points, oracle bounce frames, or oracle velocities, and all primary rows use the same ITF skid-footprint decision rule. Full report: [`docs/benchmark.md`](docs/benchmark.md).
+
+| Metric | 1-Cam Static Frame-0 Homography | 1-Cam Dynamic Homography + 2D Outlier Interp | 2-Cam DLT 3D + KNN + Sub-Frame Ballistic Fit | **4-Cam Stadium DLT 3D + KNN + Sub-Frame Ballistic Fit** |
+|---|---:|---:|---:|---:|
+| Bounce localization error — median | 3625.14 mm | 2708.21 mm | 52.64 mm | **31.27 mm** |
+| Bounce localization error — p90 | 7259.74 mm | 8029.80 mm | 146.97 mm | **87.62 mm** |
+| Bounce localization error — mean | 3990.64 mm | 3260.23 mm | 82.58 mm | **58.87 mm** |
+| Overall line-call accuracy (`N = 300`) | 51.33% | 53.33% | 79.33% | **83.33%** |
+| Tight-call accuracy within `+/-35 mm` (`N = 242`) | 53.72% | 54.96% | 76.86% | **80.17%** |
+| Uncertainty calibration — Brier score (lower is better) | — | — | 0.1568 | **0.1149** |
+| Lateral 95% CI coverage (`|err_y| <= 1.96 * sigma_y`) | — | — | 76.33% | **84.67%** |
+
+### Controlled Skid-Footprint Ablation (Identical 2-Cam DLT 3D Coordinates)
+
+| Decision Rule (2-Cam DLT 3D Fixed) | Overall Accuracy | Tight Accuracy (`+/-35 mm`) |
+|---|---:|---:|
+| Center-point only (`use_skid_footprint=False`) | 73.33% | 70.25% |
+| **Oblique skid ellipse (`use_skid_footprint=True`)** | **79.33%** | **76.86%** |
+
+Holding reconstructed 2-Cam DLT coordinates identical, modeling the oblique elliptical skid footprint improves tight-call accuracy by **+6.61 percentage points** (`70.25%` → `76.86%`).
+
+---
+
+## 4. Limitations & Negative Results
+
+1. **Monocular `Z = 0` Parallax Limit (~2.7–3.6 m median error):** Projecting single-camera 2D pixel detections onto the `Z = 0` ground plane fundamentally conflates ball height with ground range along the viewing ray. Even with exact dynamic per-frame homography `H_t`, single-camera tight-call accuracy (`54.96%`) remains near random chance.
+2. **Classical Color/Motion Ball Detector (`ChromaMotionBallDetector`):** Video inference in `hawkeye-lite predict` uses optic-yellow HSV segmentation + warped frame differencing rather than a trained spatiotemporal CNN; accuracy degrades under severe motion blur, court color clutter (e.g., clay/yellow banners), or player occlusion.
+3. **Heavy-Tailed 95% CI Under-Coverage Under Clutter Spikes:** Propagating Gaussian `(J^T J)^-1` DLT + quadratic regression covariance yields `76.33%` (2-cam) and `84.67%` (4-cam) empirical coverage at nominal 95% CI when 6% `+/-80 px` clutter spikes slip near impact — highlighting why distribution-free conformal bounds outperform Gaussian error ellipses under non-Gaussian detection outliers.
+
+---
+
+## 5. Quick Start & Verification
+
+### Python CLI
 
 ```bash
-uv sync
+pip install -e .
 
-# 1. Generate a realistic input tennis rally video (.mp4)
-uv run hawkeye-lite synth --scenario ao_sideline_in --output samples/input_rally.mp4
+# Generate a synthetic rally clip (.mp4)
+hawkeye-lite synth --scenario ao_sideline_in --output samples/input_rally.mp4
 
-# 2. Run Hawk-Eye Lite: Video Input (.mp4) -> Video Output (.mp4) with Minimap & 3D Replay
-uv run hawkeye-lite predict \
-  --input_video_path samples/input_rally.mp4 \
-  --output_video_path samples/output_hawkeye.mp4 \
-  --minimap 1 \
-  --bounce 1 \
-  --report samples/report.json
+# Monocular broadcast inference (court lines + minimap + Z=0 replay)
+hawkeye-lite predict --input_video_path samples/input_rally.mp4 --output_video_path samples/output.mp4 --minimap 1 --bounce 1
 
-# 3. Run the 300-scenario paired ablation benchmark
-uv run hawkeye-lite benchmark
+# Run the 300-scenario 2D-pixel-only benchmark
+hawkeye-lite benchmark
 
-# 4. Regenerate deterministic benchmark docs & web data (checked in CI)
-uv run hawkeye-lite export --check
+# Regenerate & check docs/benchmark.md and web/public/data/hawkeye_data.json
+hawkeye-lite export --check
 ```
 
-### Interactive 3D Broadcast & Line-Call Web Studio (`web/`)
+### Interactive Web Studio (`web/`)
 
 ```bash
 cd web
 npm install
+npm run check   # typecheck + biome + vitest + production build
 npm run dev
 ```
 
-Open `http://localhost:5173` to orbit the **SEU 3D Wireframe Court**, toggle **Raw Noisy 3D → Multi-Plane KNN → Constrained 3D Curve**, inspect the **12 Court Homography Configurations**, and explore the **300-Scenario Benchmark**.
+### Quality Gates
+
+| Gate | Command | Status / Threshold |
+|---|---|---|
+| Lint | `ruff check .` | Zero errors |
+| Strict typing | `mypy` | `strict = true`, zero errors |
+| Tests & Branch Coverage | `pytest --cov` | Unit, Hypothesis property, and `.mp4 -> .mp4` tests (`>= 90%` branch coverage) |
+| Data Freshness | `hawkeye-lite export --check` | Zero drift against `benchmark.py` |
+| Web Studio | `npm run check` | `tsc --noEmit`, `biome`, `vitest`, `vite build` |
 
 ---
 
-## 4. Repository Structure
+## Repository Structure
 
 ```text
 hawkeye-lite/
-├── geometry/                # CourtReference (12 configs), 26-pt 3D world coords, DLT homography & triangulation
-├── camera/                  # PinholeCamera (P = K[R|t]), homography-to-3D pose & virtual replay camera
-├── vision/                  # Vectorized CourtDetector, ShotSegmenter cutaway gate, Player/Ball Detection & Minimap
-├── tracking/                # SORT Kalman tracker, 3-pass outlier interpolation, 3D KNN & constrained curve fit
-├── decision/                # Oblique elliptical skid footprint vs 50mm ITF line outer edge (IN/OUT + mm + sigma)
-├── evaluation/              # predict_video.py pipeline, synthetic video generator, 300-case benchmark & CLI
-├── tests/                   # Unit, property (Hypothesis) & end-to-end .mp4->.mp4 tests (>= 90% branch coverage)
-├── web/                     # Zero-backend React 19 + TypeScript 3D Court & Broadcast Replay Studio
-└── docs/                    # System architecture, ADRs (0001-0003) & generated benchmark report
+├── geometry/     # CourtReference (12 configs), 26-pt 3D world coords, DLT homography & triangulation
+├── camera/       # PinholeCamera (P = K[R|t]), homography-to-3D pose & synthetic projection
+├── vision/       # Vectorized CourtDetector, ShotSegmenter cutaway gate, ChromaMotionBallDetector, SORT/minimap
+├── tracking/     # Multi-view DLT consensus, 3-plane KNN filter, sub-frame ballistic & RK4 solver
+├── decision/     # Oblique elliptical skid footprint vs. 50 mm ITF line + uncertainty propagation
+├── evaluation/   # Monocular video pipeline, 300-scenario 2D-pixel-only benchmark, deterministic export & CLI
+├── tests/        # Unit, Hypothesis property & video pipeline tests
+└── web/          # Static React 19 + TypeScript 3D Court & Benchmark Studio
 ```
 
----
+## References
 
-## 5. Verification & Quality Gates
-
-```bash
-make check
-```
-
-| Layer | Tooling | Gate |
-|---|---|---|
-| Python lint & format | `ruff check` + `ruff format --check` | Zero warnings |
-| Python typing | `mypy --strict` | Zero errors across all 28 source & test files |
-| Python tests | `pytest` + `hypothesis` |Unit, property & `.mp4 → .mp4` video tests, `≥ 90%` branch coverage (`~93%`) |
-| Data freshness | `hawkeye-lite export --check` | Fails CI if `docs/benchmark.md` or `web/public/data/hawkeye_data.json` drifts |
-| Web studio | `tsc --noEmit`, `biome`, `vitest`, `vite build` | Zero warnings, production bundle verified |
-
----
-
-## References & Credits
-
-- Core monocular court detection (`CourtReference` 12 configurations, `CourtDetector`, dynamic top-down minimap, and SORT player tracking) adapted and vectorized from [`ArtLabss/tennis-tracking`](https://github.com/ArtLabss/tennis-tracking).
-- 26-point 3D ITF world coordinate calibration, multi-plane (`xy`/`yz`/`xz`) KNN trajectory outlier filtering, and endpoint-constrained 3D curve optimization adapted from [`GehaoZhang6/SEU-Robot-Vision-Project-tennis-Hawkeye-system`](https://github.com/GehaoZhang6/SEU-Robot-Vision-Project-tennis-Hawkeye-system).
-- Yu-Chuan Huang et al., *"TrackNet: A Deep Learning Network for Tracking High-speed and Tiny Objects in Sports Applications,"* IEEE AVSS 2019.
+- Court template (`CourtReference` 12 configurations) and dynamic minimap tracking concepts adapted from `ArtLabss/tennis-tracking`.
+- 26-point 3D ITF wireframe coordinates and multi-plane KNN trajectory filtering adapted from `GehaoZhang6/SEU-Robot-Vision-Project-tennis-Hawkeye-system`.
 
 MIT License

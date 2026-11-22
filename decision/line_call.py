@@ -98,6 +98,8 @@ def evaluate_line_call(
     homography_img_to_m: NDArray[np.float64] | None = None,
     bounce_uv_px: tuple[float, float] | None = None,
     pixel_sigma_px: float = 0.65,
+    explicit_sigma_xy_mm: tuple[float, float] | None = None,
+    extra_sigma_mm: float = 0.0,
 ) -> LineCallDecision:
     """Evaluate an ``IN`` / ``OUT`` tennis line call against ITF singles or doubles court boundaries.
 
@@ -139,15 +141,18 @@ def evaluate_line_call(
     is_in = margin_mm >= 0.0
     verdict = "IN" if is_in else "OUT"
 
-    # Propagate 2D sub-pixel uncertainty through homography Jacobian if available
-    if homography_img_to_m is not None and bounce_uv_px is not None:
+    # Propagate 3D triangulation covariance or 2D homography Jacobian uncertainty
+    if explicit_sigma_xy_mm is not None:
+        sigma_mm = float(np.hypot(explicit_sigma_xy_mm[axis_idx], extra_sigma_mm))
+        sigma_mm = float(np.clip(sigma_mm, 0.8, 120.0))
+    elif homography_img_to_m is not None and bounce_uv_px is not None:
         j_mat = homography_jacobian(homography_img_to_m, bounce_uv_px[0], bounce_uv_px[1])
         cov_uv = np.eye(2, dtype=np.float64) * (pixel_sigma_px**2)
         cov_xy_m2 = j_mat @ cov_uv @ j_mat.T
         sigma_m = float(np.sqrt(max(float(cov_xy_m2[axis_idx, axis_idx]), 1e-8)))
-        sigma_mm = float(np.clip(sigma_m * 1000.0, 0.8, 35.0))
+        sigma_mm = float(np.clip(np.hypot(sigma_m * 1000.0, extra_sigma_mm), 0.8, 250.0))
     else:
-        sigma_mm = 2.2
+        sigma_mm = float(np.clip(np.hypot(5.0, extra_sigma_mm), 0.8, 250.0))
 
     # Gaussian cumulative probability P(IN) = Phi(margin_mm / sigma_mm)
     z_score = margin_mm / max(sigma_mm, 1e-6)

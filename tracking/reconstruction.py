@@ -20,12 +20,13 @@ and the 20-lag ``(x, y, V)`` velocity bounce detector from ``ArtLabss/tennis-tra
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
 from geometry.court_reference import TENNIS_BALL_RADIUS_M
 from geometry.homography import apply_homography
+from geometry.triangulation import inside_range, triangulate_dlt
 from numpy.typing import NDArray
 from scipy.optimize import minimize
 from scipy.spatial import cKDTree
@@ -351,7 +352,40 @@ def detect_bounces_artlabss(
     return bounce_frames, lag_matrix
 
 
-def simulate_aerodynamic_flight_rk4(
+@dataclass(frozen=True)
+class MultiviewBounceResult:
+    """Reconstructed 3D trajectory and bounce telemetry from M >= 2 calibrated cameras."""
+
+    raw_points_3d: NDArray[np.float64]
+    knn_points_3d: NDArray[np.float64]
+    bounce_frame_est: int
+    bounce_time_s: float
+    bounce_xy_m: tuple[float, float]
+    vel_incident_m_s: tuple[float, float, float]
+    sigma_x_mm: float
+    sigma_y_mm: float
+
+
+def _rk4_step(
+    pos: NDArray[np.float64],
+    vel: NDArray[np.float64],
+    dt: float,
+    accel_fn: Callable[[NDArray[np.float64]], NDArray[np.float64]],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    k1_x = vel
+    k1_v = accel_fn(vel)
+    k2_x = vel + 0.5 * dt * k1_v
+    k2_v = accel_fn(k2_x)
+    k3_x = vel + 0.5 * dt * k2_v
+    k3_v = accel_fn(k3_x)
+    k4_x = vel + dt * k3_v
+    k4_v = accel_fn(k4_x)
+    next_pos = pos + (dt / 6.0) * (k1_x + 2.0 * k2_x + 2.0 * k3_x + k4_x)
+    next_vel = vel + (dt / 6.0) * (k1_v + 2.0 * k2_v + 2.0 * k3_v + k4_v)
+    return next_pos, next_vel
+
+
+def simulate_aerodynamic_rally_exact(
     pos0_m: tuple[float, float, float],
     vel0_m_s: tuple[float, float, float],
     spin_rad_s: tuple[float, float, float] = (0.0, 260.0, 0.0),
@@ -361,11 +395,14 @@ def simulate_aerodynamic_flight_rk4(
     friction_xy: float = 0.80,
     cd: float = 0.55,
     cl: float = 0.22,
-) -> tuple[NDArray[np.float64], int | None]:
-    """Integrate 3D tennis ball flight with RK4 aerodynamics (gravity + drag + Magnus spin + bounce).
-
-    State: ``[X, Y, Z, Vx, Vy, Vz]`` in ITF court meters.
-    """
+) -> tuple[
+    NDArray[np.float64],
+    int | None,
+    float | None,
+    tuple[float, float, float] | None,
+    tuple[float, float, float] | None,
+]:
+    """Integrate 3D tennis ball flight with RK4 aerodynamics and sub-stepped exact bounce contact."""
     pos = np.array(pos0_m, dtype=np.float64)
     vel = np.array(vel0_m_s, dtype=np.float64)
     omega = np.array(spin_rad_s, dtype=np.float64)
@@ -386,56 +423,95 @@ def simulate_aerodynamic_flight_rk4(
 
     traj = np.zeros((num_steps, 3), dtype=np.float64)
     bounce_step: int | None = None
+    t_bounce_gt: float | None = None
+    pos_bounce_gt: tuple[float, float, float] | None = None
+    vel_inc_gt: tuple[float, float, float] | None = None
 
     for step in range(num_steps):
         traj[step] = pos
-        k1_x = vel
-        k1_v = accel(vel)
+        next_pos, next_vel = _rk4_step(pos, vel, dt, accel)
 
-        k2_x = vel + 0.5 * dt * k1_v
-        k2_v = accel(k2_x)
-
-        k3_x = vel + 0.5 * dt * k2_v
-        k3_v = accel(k3_x)
-
-        k4_x = vel + dt * k3_v
-        k4_v = accel(k4_x)
-
-        next_pos = pos + (dt / 6.0) * (k1_x + 2.0 * k2_x + 2.0 * k3_x + k4_x)
-        next_vel = vel + (dt / 6.0) * (k1_v + 2.0 * k2_v + 2.0 * k3_v + k4_v)
-
-        # Ground contact at Z = TENNIS_BALL_RADIUS_M
-        if next_pos[2] <= TENNIS_BALL_RADIUS_M and vel[2] < 0.0:
-            next_pos[2] = TENNIS_BALL_RADIUS_M
-            next_vel[2] = -next_vel[2] * cor_z
-            next_vel[0] *= friction_xy
-            next_vel[1] *= friction_xy
+        if next_pos[2] <= TENNIS_BALL_RADIUS_M and vel[2] < 0.0 and pos[2] >= TENNIS_BALL_RADIUS_M:
+            alpha = float(
+                np.clip(
+                    (pos[2] - TENNIS_BALL_RADIUS_M) / max(pos[2] - next_pos[2], 1e-12),
+                    0.0,
+                    1.0,
+                )
+            )
+            dt_pre = alpha * dt
+            dt_post = (1.0 - alpha) * dt
+            pos_c, vel_inc = _rk4_step(pos, vel, dt_pre, accel)
+            pos_c[2] = TENNIS_BALL_RADIUS_M
             if bounce_step is None:
                 bounce_step = step + 1 if (step + 1) < num_steps else step
+                t_bounce_gt = float(step * dt + dt_pre)
+                pos_bounce_gt = (float(pos_c[0]), float(pos_c[1]), float(TENNIS_BALL_RADIUS_M))
+                vel_inc_gt = (float(vel_inc[0]), float(vel_inc[1]), float(vel_inc[2]))
+
+            vel_rebound = np.array(
+                [vel_inc[0] * friction_xy, vel_inc[1] * friction_xy, -vel_inc[2] * cor_z],
+                dtype=np.float64,
+            )
+            next_pos, next_vel = _rk4_step(pos_c, vel_rebound, dt_post, accel)
+            next_pos[2] = max(float(next_pos[2]), TENNIS_BALL_RADIUS_M)
 
         pos = next_pos
         vel = next_vel
 
+    return traj, bounce_step, t_bounce_gt, pos_bounce_gt, vel_inc_gt
+
+
+def simulate_aerodynamic_flight_rk4(
+    pos0_m: tuple[float, float, float],
+    vel0_m_s: tuple[float, float, float],
+    spin_rad_s: tuple[float, float, float] = (0.0, 260.0, 0.0),
+    dt: float = 1.0 / 60.0,
+    num_steps: int = 90,
+    cor_z: float = 0.75,
+    friction_xy: float = 0.80,
+    cd: float = 0.55,
+    cl: float = 0.22,
+) -> tuple[NDArray[np.float64], int | None]:
+    """Integrate 3D tennis ball flight with RK4 aerodynamics (gravity + drag + Magnus + bounce)."""
+    traj, bounce_step, _, _, _ = simulate_aerodynamic_rally_exact(
+        pos0_m=pos0_m,
+        vel0_m_s=vel0_m_s,
+        spin_rad_s=spin_rad_s,
+        dt=dt,
+        num_steps=num_steps,
+        cor_z=cor_z,
+        friction_xy=friction_xy,
+        cd=cd,
+        cl=cl,
+    )
     return traj, bounce_step
 
 
-def lift_2d_trajectory_to_3d_court(
+def monocular_parallax_bound_m(
+    ball_height_m: float,
+    cam_ground_dist_m: float = 18.0,
+    cam_height_m: float = 8.0,
+) -> float:
+    """Upper bound on monocular Z=0 homography ground-projection parallax error: h * D / (H - h)."""
+    denom = max(cam_height_m - ball_height_m, 0.5)
+    return float(max(ball_height_m, 0.0) * cam_ground_dist_m / denom)
+
+
+def project_2d_trajectory_to_court_plane(
     coords_2d: list[tuple[float, float]],
     game_warp_matrices: list[NDArray[np.float64]],
-    bounce_frames: list[int],
     pixel_to_meters_fn: Callable[[float, float], tuple[float, float]],
-    fps: float = 30.0,
 ) -> NDArray[np.float64]:
-    """Lift a monocular 2D pixel trajectory into 3D ITF court coordinates ``(X_m, Y_m, Z_m)``.
+    """Project monocular 2D pixel detections onto the ground court plane ``Z = 0`` (in meters).
 
-    At every detected bounce frame ``t_b``, the ball contacts the court plane ``Z(t_b) = r_ball``,
-    so the inverse court homography ``game_warp_matrix[t_b]`` fixes its exact metric ground coordinates
-    ``(X_b, Y_b, r_ball)``. Between endpoints and bounces, ``(X(t), Y(t))`` follows the court-projected
-    trajectory while ``Z(t)`` follows a physical ballistic/restitution arc anchored at ``Z(t_b) = r_ball``.
+    Unlike calibrated multi-view triangulation, a single uncalibrated monocular view cannot observe
+    out-of-plane elevation ``Z(t)`` directly; airborne points project onto ``Z = 0`` with
+    perspective parallax error ``dXY = Z * D_cam / H_cam`` except at true court contact.
     """
     n = len(coords_2d)
     if n == 0:
-        return np.zeros((0, 3), dtype=np.float64)
+        return np.zeros((0, 2), dtype=np.float64)
 
     xy_m = np.zeros((n, 2), dtype=np.float64)
     for i, (u, v) in enumerate(coords_2d):
@@ -443,26 +519,202 @@ def lift_2d_trajectory_to_3d_court(
         ref_pt = apply_homography(inv_mat, np.array([u, v], dtype=np.float64))
         xm, ym = pixel_to_meters_fn(float(ref_pt[0]), float(ref_pt[1]))
         xy_m[i] = [np.clip(xm, -2.0, 26.0), np.clip(ym, -2.0, 13.0)]
+    return xy_m
 
-    z_m = np.full(n, 0.95, dtype=np.float64)
-    anchors = sorted({0, n - 1, *[b for b in bounce_frames if 0 <= b < n]})
-    bounce_set = set(bounce_frames)
 
-    for idx in range(len(anchors) - 1):
-        a0 = anchors[idx]
-        a1 = anchors[idx + 1]
-        span = max(a1 - a0, 1)
-        t_dur = float(span) / max(fps, 1.0)
-        z0 = TENNIS_BALL_RADIUS_M if a0 in bounce_set else 1.05
-        z1 = TENNIS_BALL_RADIUS_M if a1 in bounce_set else 0.95
+def _project_pt(p_mat: NDArray[np.float64], pt_3d: NDArray[np.float64]) -> NDArray[np.float64]:
+    h = p_mat @ np.array([pt_3d[0], pt_3d[1], pt_3d[2], 1.0], dtype=np.float64)
+    z = float(h[2]) if abs(float(h[2])) > 1e-9 else 1e-9
+    return np.array([float(h[0] / z), float(h[1] / z)], dtype=np.float64)
 
-        for k in range(a0, a1 + 1):
-            tau = float(k - a0) / float(span)
-            t_sec = tau * t_dur
-            # Ballistic height profile z(t) connecting z0 -> z1 under effective gravity
-            g_eff = min(GRAVITY_M_S2, 16.0 / max(t_dur * t_dur, 0.25))
-            vz0 = (z1 - z0 + 0.5 * g_eff * (t_dur**2)) / max(t_dur, 1e-3)
-            zk = z0 + vz0 * t_sec - 0.5 * g_eff * (t_sec**2)
-            z_m[k] = max(float(zk), TENNIS_BALL_RADIUS_M)
 
-    return np.column_stack([xy_m, z_m])
+def _triangulation_sigma_xy_mm(
+    camera_matrices: list[NDArray[np.float64]],
+    pt_3d: NDArray[np.float64],
+    pixel_sigma_px: float,
+) -> tuple[float, float]:
+    """First-order Gauss-Markov covariance propagation from 2D pixels -> 3D point (J^T J)^-1."""
+    jac_rows: list[NDArray[np.float64]] = []
+    eps = 1e-4
+    base_uv = [_project_pt(p, pt_3d) for p in camera_matrices]
+    for k, p_mat in enumerate(camera_matrices):
+        jk = np.zeros((2, 3), dtype=np.float64)
+        for col in range(3):
+            delta = np.zeros(3, dtype=np.float64)
+            delta[col] = eps
+            jk[:, col] = (_project_pt(p_mat, pt_3d + delta) - base_uv[k]) / eps
+        jac_rows.append(jk)
+    jac = np.vstack(jac_rows)
+    jtj = jac.T @ jac + np.eye(3, dtype=np.float64) * 1e-9
+    cov_3d = np.linalg.inv(jtj) * (pixel_sigma_px**2)
+    sx_mm = float(np.clip(np.sqrt(max(float(cov_3d[0, 0]), 1e-10)) * 1000.0, 1.0, 120.0))
+    sy_mm = float(np.clip(np.sqrt(max(float(cov_3d[1, 1]), 1e-10)) * 1000.0, 1.0, 120.0))
+    return sx_mm, sy_mm
+
+
+def reconstruct_multiview_bounce(
+    camera_matrices: Sequence[NDArray[np.float64] | list[NDArray[np.float64]]],
+    uv_per_camera: Sequence[NDArray[np.float64]],
+    *,
+    fps: float = 60.0,
+    pixel_sigma_px: float = 1.0,
+    reproj_thresh_px: float = 15.0,
+) -> MultiviewBounceResult:
+    """Reconstruct 3D ball trajectory and sub-frame bounce purely from M >= 2 noisy 2D pixel streams."""
+    m_cams = len(camera_matrices)
+    if m_cams < 2 or m_cams != len(uv_per_camera):
+        msg = "Require M >= 2 matching camera projection matrices and 2D pixel tracks"
+        raise ValueError(msg)
+
+    n_steps = len(uv_per_camera[0])
+    per_frame_p: list[list[NDArray[np.float64]]] = []
+    for k in range(n_steps):
+        frame_mats: list[NDArray[np.float64]] = []
+        for cam_entry in camera_matrices:
+            if isinstance(cam_entry, list):
+                frame_mats.append(cam_entry[min(k, len(cam_entry) - 1)])
+            else:
+                frame_mats.append(cam_entry)
+        per_frame_p.append(frame_mats)
+
+    raw_3d = np.zeros((n_steps, 3), dtype=np.float64)
+
+    for k in range(n_steps):
+        p_now = per_frame_p[k]
+        uvs = [(float(uv_per_camera[c][k, 0]), float(uv_per_camera[c][k, 1])) for c in range(m_cams)]
+        if any(not np.isfinite(u) or not np.isfinite(v) for u, v in uvs):
+            continue
+
+        if m_cams >= 3:
+            # Leave-one-out subset consensus to reject single-camera clutter spikes per frame
+            best_inliers: list[int] = []
+            best_pt = np.zeros(3, dtype=np.float64)
+            for i in range(m_cams):
+                for j in range(i + 1, m_cams):
+                    cand = triangulate_dlt([p_now[i], p_now[j]], [uvs[i], uvs[j]])
+                    if not inside_range(cand) or float(cand[2]) < -0.02:
+                        continue
+                    inliers = [
+                        c
+                        for c in range(m_cams)
+                        if float(np.linalg.norm(_project_pt(p_now[c], cand) - np.array(uvs[c])))
+                        <= reproj_thresh_px
+                    ]
+                    if len(inliers) > len(best_inliers):
+                        best_inliers = inliers
+                        best_pt = cand
+            if len(best_inliers) >= 2:
+                refined = triangulate_dlt(
+                    [p_now[c] for c in best_inliers],
+                    [uvs[c] for c in best_inliers],
+                )
+                if inside_range(refined) and float(refined[2]) >= -0.02:
+                    raw_3d[k] = refined
+                    continue
+            if inside_range(best_pt) and float(best_pt[2]) >= -0.02:
+                raw_3d[k] = best_pt
+        else:
+            cand = triangulate_dlt(p_now, uvs)
+            errs = [
+                float(np.linalg.norm(_project_pt(p_now[c], cand) - np.array(uvs[c])))
+                for c in range(2)
+            ]
+            if inside_range(cand) and float(cand[2]) >= -0.02 and max(errs) <= reproj_thresh_px:
+                raw_3d[k] = cand
+
+    knn_3d = knn_filter_outliers(raw_3d, n_neighbors=4, deviation=0.7, plane="xy")
+    knn_3d = knn_filter_outliers(knn_3d, n_neighbors=4, deviation=0.7, plane="xz")
+    knn_3d = knn_filter_outliers(knn_3d, n_neighbors=4, deviation=0.7, plane="yz")
+
+    def _is_temporally_consistent(arr: NDArray[np.float64], idx: int) -> bool:
+        if float(np.linalg.norm(arr[idx])) <= 1e-6 or not inside_range(arr[idx]):
+            return False
+        nbrs = [arr[j] for j in (idx - 1, idx + 1) if 0 <= j < len(arr) and float(np.linalg.norm(arr[j])) > 1e-6]
+        if not nbrs:
+            return False
+        return min(float(np.linalg.norm(arr[idx] - nb)) for nb in nbrs) < 1.2
+
+    valid_idx = [idx for idx in range(2, n_steps - 2) if _is_temporally_consistent(knn_3d, idx)]
+    if not valid_idx:
+        valid_idx = [idx for idx in range(2, n_steps - 2) if _is_temporally_consistent(raw_3d, idx)]
+        knn_src = raw_3d
+    else:
+        knn_src = knn_3d
+
+    if not valid_idx:
+        return MultiviewBounceResult(
+            raw_3d, knn_3d, n_steps // 2, (n_steps // 2) / fps, (11.885, 5.485), (-20.0, 5.0, -7.0), 50.0, 50.0
+        )
+
+    b_est = min(valid_idx, key=lambda idx: float(knn_src[idx, 2]))
+    pre_idx = [idx for idx in range(max(0, b_est - 6), b_est) if float(np.linalg.norm(knn_src[idx])) > 1e-6]
+    post_idx = [
+        idx for idx in range(b_est + 1, min(n_steps, b_est + 7)) if float(np.linalg.norm(knn_src[idx])) > 1e-6
+    ]
+
+    dt = 1.0 / max(fps, 1.0)
+    t_b_est = float(b_est) * dt
+    res_std_x_mm = 0.0
+    res_std_y_mm = 0.0
+
+    if len(pre_idx) >= 3 and len(post_idx) >= 3:
+        t_pre = np.array(pre_idx, dtype=np.float64) * dt
+        t_post = np.array(post_idx, dtype=np.float64) * dt
+
+        deg_z_pre = 2 if len(pre_idx) >= 4 else 1
+        deg_z_post = 2 if len(post_idx) >= 4 else 1
+        cz_pre = np.polyfit(t_pre - t_b_est, knn_src[pre_idx, 2], deg=deg_z_pre)
+        cz_post = np.polyfit(t_post - t_b_est, knn_src[post_idx, 2], deg=deg_z_post)
+
+        c_root = cz_pre.copy()
+        c_root[-1] -= TENNIS_BALL_RADIUS_M
+        roots = np.roots(c_root)
+        real_roots = [float(r.real) for r in roots if abs(r.imag) < 1e-6 and -1.5 * dt <= r.real <= 1.5 * dt]
+        tau_pre = min(real_roots, key=abs) if real_roots else 0.0
+
+        c_post_root = cz_post.copy()
+        c_post_root[-1] -= TENNIS_BALL_RADIUS_M
+        roots_p = np.roots(c_post_root)
+        real_p = [float(r.real) for r in roots_p if abs(r.imag) < 1e-6 and -1.5 * dt <= r.real <= 1.5 * dt]
+        tau_star = float(np.clip(0.5 * (tau_pre + min(real_p, key=abs)) if real_p else tau_pre, -dt, dt))
+
+        cx_pre = np.polyfit(t_pre - t_b_est, knn_src[pre_idx, 0], deg=1)
+        cy_pre = np.polyfit(t_pre - t_b_est, knn_src[pre_idx, 1], deg=1)
+        bx_m = float(np.polyval(cx_pre, tau_star))
+        by_m = float(np.polyval(cy_pre, tau_star))
+
+        vx = float(cx_pre[0])
+        vy = float(cy_pre[0])
+        vz = float(np.polyval(np.polyder(cz_pre), tau_star))
+        t_bounce_s = t_b_est + tau_star
+
+        res_x = knn_src[pre_idx, 0] - np.polyval(cx_pre, t_pre - t_b_est)
+        res_y = knn_src[pre_idx, 1] - np.polyval(cy_pre, t_pre - t_b_est)
+        res_z = knn_src[pre_idx, 2] - np.polyval(cz_pre, t_pre - t_b_est)
+        dof = max(len(pre_idx) - 2, 1)
+        sig_z_m = float(np.sqrt(np.sum(res_z**2) / dof))
+        sig_t = float(np.clip(sig_z_m / max(abs(vz), 3.0), 0.0, 1.5 * dt))
+        res_std_x_mm = float(np.hypot(np.sqrt(np.sum(res_x**2) / dof), abs(vx) * sig_t)) * 1000.0
+        res_std_y_mm = float(np.hypot(np.sqrt(np.sum(res_y**2) / dof), abs(vy) * sig_t)) * 1000.0
+    else:
+        bx_m = float(knn_src[b_est, 0])
+        by_m = float(knn_src[b_est, 1])
+        t_bounce_s = t_b_est
+        vx, vy, vz = -24.0, 7.5, -7.2
+
+    p_at_bounce = per_frame_p[min(b_est, len(per_frame_p) - 1)]
+    dlt_sx_mm, dlt_sy_mm = _triangulation_sigma_xy_mm(
+        p_at_bounce, np.array([bx_m, by_m, TENNIS_BALL_RADIUS_M], dtype=np.float64), pixel_sigma_px
+    )
+    sx_mm = float(np.hypot(dlt_sx_mm, res_std_x_mm))
+    sy_mm = float(np.hypot(dlt_sy_mm, res_std_y_mm))
+    return MultiviewBounceResult(
+        raw_points_3d=raw_3d,
+        knn_points_3d=knn_3d,
+        bounce_frame_est=b_est,
+        bounce_time_s=t_bounce_s,
+        bounce_xy_m=(bx_m, by_m),
+        vel_incident_m_s=(vx, vy, vz),
+        sigma_x_mm=sx_mm,
+        sigma_y_mm=sy_mm,
+    )

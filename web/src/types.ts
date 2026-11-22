@@ -5,6 +5,8 @@ export interface MethodSummary {
   bounce_error_mean_mm: number;
   line_call_accuracy_pct: number;
   tight_call_accuracy_pct: number;
+  brier_score?: number | null;
+  ci95_coverage_pct?: number | null;
 }
 
 export interface ReplayScenario {
@@ -40,11 +42,15 @@ export interface HawkeyePayload {
   benchmark: {
     total_cases: number;
     tight_cases_count: number;
-    static_baseline: MethodSummary;
-    artlabss_2d: MethodSummary;
-    hawkeye_3d: MethodSummary;
-    mean_error_reduction_vs_static_mm: number;
-    mean_error_reduction_vs_artlabss_mm: number;
+    tight_in_rate_pct: number;
+    static_1cam: MethodSummary;
+    dynamic_1cam: MethodSummary;
+    dlt_2cam: MethodSummary;
+    dlt_4cam: MethodSummary;
+    skid_ablation_2cam_no_skid_acc_pct: number;
+    skid_ablation_2cam_no_skid_tight_pct: number;
+    mean_error_reduction_2cam_vs_1cam_mm: number;
+    mean_error_reduction_4cam_vs_2cam_mm: number;
   };
   replays: ReplayScenario[];
 }

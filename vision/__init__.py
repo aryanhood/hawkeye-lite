@@ -2,8 +2,8 @@
 
 from vision.court_detector import CourtDetector
 from vision.detection import (
+    ChromaMotionBallDetector,
     DetectionModel,
-    TrackNetMotionBallDetector,
     area_of_box,
     boxes_dist,
     center_of_box,
@@ -16,11 +16,11 @@ from vision.shot_segmenter import CameraViewType, FrameShotState, ShotSegmenter
 
 __all__ = [
     "CameraViewType",
+    "ChromaMotionBallDetector",
     "CourtDetector",
     "DetectionModel",
     "FrameShotState",
     "ShotSegmenter",
-    "TrackNetMotionBallDetector",
     "area_of_box",
     "boxes_dist",
     "center_of_box",

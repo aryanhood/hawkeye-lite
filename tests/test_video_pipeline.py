@@ -76,11 +76,12 @@ def test_cli_synth_benchmark_and_export(tmp_path: Path) -> None:
     assert main(["benchmark", "--seeds", "5"]) == 0
 
     case = run_single_benchmark_case(seed=1, camera_mode="panning_broadcast")
-    assert case.err_hawkeye_3d_mm < case.err_static_mm
+    assert case.err_dlt_4cam_mm < case.err_static_1cam_mm
 
     rep = run_benchmark(num_seeds=8)
     assert rep.total_cases == 24
-    assert rep.hawkeye_3d.bounce_error_mean_mm < rep.static_baseline.bounce_error_mean_mm
+    assert rep.dlt_2cam.bounce_error_median_mm < rep.static_1cam.bounce_error_median_mm
+    assert rep.dlt_4cam.bounce_error_median_mm <= rep.dlt_2cam.bounce_error_median_mm
 
     assert export_all(repo_root=tmp_path, check_only=False)
     assert export_all(repo_root=tmp_path, check_only=True)

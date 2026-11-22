@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import type { HawkeyePayload, ReplayScenario } from "./types";
 
 const FALLBACK_PAYLOAD: HawkeyePayload = {
-  version: "2.0.0",
+  version: "0.1.0",
   court: {
     length_m: 23.77,
     doubles_width_m: 10.97,
@@ -58,40 +58,59 @@ const FALLBACK_PAYLOAD: HawkeyePayload = {
   },
   benchmark: {
     total_cases: 300,
-    tight_cases_count: 220,
-    static_baseline: {
-      name: "Static Frame-0 Homography (Legacy 2D)",
-      bounce_error_median_mm: 245.1,
-      bounce_error_p90_mm: 5410.0,
-      bounce_error_mean_mm: 1850.4,
-      line_call_accuracy_pct: 64.0,
-      tight_call_accuracy_pct: 58.5,
+    tight_cases_count: 242,
+    tight_in_rate_pct: 49.59,
+    static_1cam: {
+      name: "1-Cam Static Frame-0 Homography",
+      bounce_error_median_mm: 3625.14,
+      bounce_error_p90_mm: 7259.74,
+      bounce_error_mean_mm: 3990.64,
+      line_call_accuracy_pct: 51.33,
+      tight_call_accuracy_pct: 53.72,
+      brier_score: null,
+      ci95_coverage_pct: null,
     },
-    artlabss_2d: {
-      name: "ArtLabss 2D Dynamic Homography + Interp",
-      bounce_error_median_mm: 64.2,
-      bounce_error_p90_mm: 98.4,
-      bounce_error_mean_mm: 68.1,
-      line_call_accuracy_pct: 81.3,
-      tight_call_accuracy_pct: 76.4,
+    dynamic_1cam: {
+      name: "1-Cam Dynamic Homography + 2D Outlier Interp",
+      bounce_error_median_mm: 2708.21,
+      bounce_error_p90_mm: 8029.8,
+      bounce_error_mean_mm: 3260.23,
+      line_call_accuracy_pct: 53.33,
+      tight_call_accuracy_pct: 54.96,
+      brier_score: null,
+      ci95_coverage_pct: null,
     },
-    hawkeye_3d: {
-      name: "Hawk-Eye Lite v2.0 (3D KNN + Skid Ellipse)",
-      bounce_error_median_mm: 4.1,
-      bounce_error_p90_mm: 7.8,
-      bounce_error_mean_mm: 4.5,
-      line_call_accuracy_pct: 98.3,
-      tight_call_accuracy_pct: 97.2,
+    dlt_2cam: {
+      name: "2-Cam DLT 3D + KNN + Sub-Frame Ballistic Fit",
+      bounce_error_median_mm: 52.64,
+      bounce_error_p90_mm: 146.97,
+      bounce_error_mean_mm: 82.58,
+      line_call_accuracy_pct: 79.33,
+      tight_call_accuracy_pct: 76.86,
+      brier_score: 0.1568,
+      ci95_coverage_pct: 76.33,
     },
-    mean_error_reduction_vs_static_mm: 1845.9,
-    mean_error_reduction_vs_artlabss_mm: 63.6,
+    dlt_4cam: {
+      name: "4-Cam Stadium DLT 3D + KNN + Sub-Frame Ballistic Fit",
+      bounce_error_median_mm: 31.27,
+      bounce_error_p90_mm: 87.62,
+      bounce_error_mean_mm: 58.87,
+      line_call_accuracy_pct: 83.33,
+      tight_call_accuracy_pct: 80.17,
+      brier_score: 0.1149,
+      ci95_coverage_pct: 84.67,
+    },
+    skid_ablation_2cam_no_skid_acc_pct: 73.33,
+    skid_ablation_2cam_no_skid_tight_pct: 70.25,
+    mean_error_reduction_2cam_vs_1cam_mm: 3177.65,
+    mean_error_reduction_4cam_vs_2cam_mm: 23.71,
   },
   replays: [
     {
       id: "ao_sideline_in",
       name: "ao_sideline_in",
       description:
-        "Australian Open crosscourt forehand skidding ON the right singles sideline (IN by 18.4 mm)",
+        "Australian Open crosscourt forehand near the right singles sideline (2-Cam DLT reconstruction)",
       fps: 30,
       cutaway_frames: 0,
       has_angle_switch: false,
@@ -101,7 +120,7 @@ const FALLBACK_PAYLOAD: HawkeyePayload = {
       verdict: "IN",
       is_in: true,
       margin_mm: 18.4,
-      sigma_mm: 2.1,
+      sigma_mm: 24.5,
       nearest_line: "right_singles_sideline",
       raw_points_3d: [
         [22.4, 3.2, 1.15],
@@ -191,10 +210,12 @@ export function App() {
     <div className="studio-shell">
       <header className="studio-header">
         <div>
-          <h1 className="brand-title">Hawk-Eye Lite v2.0 — 3D Broadcast & Line-Call Studio</h1>
+          <h1 className="brand-title">
+            Hawk-Eye Lite — Multi-View 3D Trajectory &amp; Line-Call Studio
+          </h1>
           <p className="brand-subtitle">
-            Video Input (.mp4) → 12-Config CourtDetector + Top-Down Minimap + 3D KNN Trajectory
-            Reconstruction → Video Output (.mp4)
+            Video Input (.mp4) → 12-Config CourtDetector + Minimap + Multi-View DLT 3D Trajectory
+            Reconstruction
           </p>
         </div>
         <nav className="tab-bar" aria-label="Studio navigation">
@@ -471,27 +492,41 @@ export function App() {
       {activeTab === "benchmark" && (
         <section className="card">
           <div className="card-title">
-            <span>300-Scenario Paired Ablation Benchmark ({data.benchmark.total_cases} Cases)</span>
+            <span>
+              300-Scenario 2D-Pixel-Only Benchmark ({data.benchmark.total_cases} Cases · Tight IN{" "}
+              {data.benchmark.tight_in_rate_pct.toFixed(1)}%)
+            </span>
             <span className="badge badge-in">
-              -{data.benchmark.mean_error_reduction_vs_artlabss_mm.toFixed(1)} mm vs 2D Interp
+              -{data.benchmark.mean_error_reduction_2cam_vs_1cam_mm.toFixed(1)} mm (2-Cam vs 1-Cam)
             </span>
           </div>
+          <p className="brand-subtitle" style={{ marginBottom: 12 }}>
+            Controlled 2-Cam Skid Ablation: center-point only{" "}
+            <code>{data.benchmark.skid_ablation_2cam_no_skid_acc_pct.toFixed(2)}%</code> overall /{" "}
+            <code>{data.benchmark.skid_ablation_2cam_no_skid_tight_pct.toFixed(2)}%</code> tight vs.
+            oblique skid ellipse{" "}
+            <code>{data.benchmark.dlt_2cam.line_call_accuracy_pct.toFixed(2)}%</code> overall /{" "}
+            <code>{data.benchmark.dlt_2cam.tight_call_accuracy_pct.toFixed(2)}%</code> tight.
+          </p>
           <table className="metric-table">
             <thead>
               <tr>
                 <th>Method</th>
-                <th>Median Bounce Error</th>
-                <th>p90 Bounce Error</th>
-                <th>Mean Bounce Error</th>
-                <th>Overall Call Accuracy</th>
-                <th>Tight Call Accuracy (±35 mm)</th>
+                <th>Median Error</th>
+                <th>p90 Error</th>
+                <th>Mean Error</th>
+                <th>Overall Acc</th>
+                <th>Tight Acc (±35 mm)</th>
+                <th>Brier</th>
+                <th>95% CI Cov</th>
               </tr>
             </thead>
             <tbody>
               {[
-                data.benchmark.static_baseline,
-                data.benchmark.artlabss_2d,
-                data.benchmark.hawkeye_3d,
+                data.benchmark.static_1cam,
+                data.benchmark.dynamic_1cam,
+                data.benchmark.dlt_2cam,
+                data.benchmark.dlt_4cam,
               ].map((m) => (
                 <tr key={m.name}>
                   <td>
@@ -502,6 +537,10 @@ export function App() {
                   <td>{m.bounce_error_mean_mm.toFixed(2)} mm</td>
                   <td>{m.line_call_accuracy_pct.toFixed(2)}%</td>
                   <td>{m.tight_call_accuracy_pct.toFixed(2)}%</td>
+                  <td>{m.brier_score != null ? m.brier_score.toFixed(4) : "—"}</td>
+                  <td>
+                    {m.ci95_coverage_pct != null ? `${m.ci95_coverage_pct.toFixed(2)}%` : "—"}
+                  </td>
                 </tr>
               ))}
             </tbody>

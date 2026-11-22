@@ -1,7 +1,7 @@
 [project]
 name = "hawkeye-lite"
-version = "2.0.0"
-description = "Monocular & multi-angle video-to-video tennis Hawk-Eye: 12-config court detection, dynamic minimap, 3D KNN trajectory reconstruction, and millimeter IN/OUT line calling."
+version = "0.1.0"
+description = "Tennis court calibration, multi-view DLT 3D triangulation, and millimeter IN/OUT line calling."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

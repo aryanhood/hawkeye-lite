@@ -4,17 +4,17 @@ Combines:
 1. ``ArtLabss/tennis-tracking/predict_video.py`` workflow:
    - Pass 1: Per-frame ``ShotSegmenter`` cutaway gating, ``CourtDetector.detect`` / ``track_court``
      (with automatic re-detection on camera cuts or pan drift), ``DetectionModel.detect_player_1``,
-     ``detect_top_persons``, ``find_player_2_box``, and ``TrackNetMotionBallDetector`` + ``BallKalmanTracker``.
+     ``detect_top_persons``, ``find_player_2_box``, and ``ChromaMotionBallDetector`` + ``BallKalmanTracker``.
    - Pass 2: 3-pass ``diff_xy`` + ``remove_outliers`` + ``interpolation``, ``calculate_feet_positions``
-     with ``savgol_filter``, 20-lag ``detect_bounces_artlabss``, 3D lifting & SEU multi-plane KNN
-     curve reconstruction, and ``evaluate_line_call`` (oblique skid ellipse vs. 50 mm ITF line).
+     with ``savgol_filter``, 20-lag ``detect_bounces_artlabss``, 2D court-plane homography projection,
+     and ``evaluate_line_call`` (with homography Jacobian uncertainty propagation).
    - Output Rendering:
      * Projected court line overlay (suppressed cleanly on non-court cutaways!)
      * Player 1 & Player 2 bounding boxes
      * 8-frame yellow ball comet trail (``deque(maxlen=8)``)
      * Dynamic 2D Top-Down Court Minimap merged in top-right corner when ``--minimap=1``
-     * Bounce circles, live ``IN`` / ``OUT`` millimeter banner, and appended **3D SEU / Australian Open
-       Hawk-Eye Challenge Replay Cut-in** when ``--bounce=1``.
+     * Bounce circles, ``IN`` / ``OUT`` court-plane margin banner, and appended **Monocular Court-Plane
+       Bounce Replay Cut-in** when ``--bounce=1``.
 """
 
 from __future__ import annotations
@@ -39,14 +39,14 @@ from numpy.typing import NDArray
 from tracking.interpolation import diff_xy, interpolation, remove_outliers
 from tracking.reconstruction import (
     detect_bounces_artlabss,
-    lift_2d_trajectory_to_3d_court,
-    reconstruct_3d_trajectory_seu,
+    monocular_parallax_bound_m,
+    project_2d_trajectory_to_court_plane,
 )
 from tracking.sort import BallKalmanTracker
 from vision.court_detector import CourtDetector
 from vision.detection import (
+    ChromaMotionBallDetector,
     DetectionModel,
-    TrackNetMotionBallDetector,
     create_top_view_image,
     mark_player_box,
     merge_minimap,
@@ -56,7 +56,7 @@ from vision.shot_segmenter import CameraViewType, FrameShotState, ShotSegmenter
 
 @dataclass(frozen=True)
 class BounceEventReport:
-    """Telemetry for a single detected bounce and its Hawk-Eye line call."""
+    """Telemetry for a single detected bounce and its court-plane line call."""
 
     frame_index: int
     pixel_uv: tuple[float, float]
@@ -80,25 +80,19 @@ class VideoPredictionResult:
     cutaway_frames: int
     num_camera_shots: int
     bounces: list[BounceEventReport]
-    trajectory_3d_m: list[list[float]]
+    trajectory_court_xy_m: list[list[float]]
 
 
-def render_3d_hawkeye_replay_frame(
+def render_court_replay_frame(
     width: int,
     height: int,
-    traj_3d: NDArray[np.float64],
+    traj_court: NDArray[np.float64],
     bounce_report: BounceEventReport | None,
     progress: float,
+    *,
+    is_monocular: bool = True,
 ) -> NDArray[np.uint8]:
-    """Render a split-screen 3D Hawk-Eye Challenge & SEU 3D Wireframe Replay frame.
-
-    - Left panel (58% width): Australian Open 3D Virtual Camera Zoom onto the bounce line,
-      showing the descending 3D trajectory ribbon, expanding dark elliptical skid mark on the
-      50 mm white line, and pulsing ``IN`` (emerald) / ``OUT`` (crimson) verdict banner.
-    - Right panel (42% width): SEU ``RECONSTRUCTION.py`` 3D isometric wireframe court plot
-      showing the full 3D reconstructed curve (blue points), green ``IN/hit`` markers, and
-      red ``OUT`` markers.
-    """
+    """Render a split-screen court-plane close-up and wireframe bounce replay frame."""
     canvas = np.full((height, width, 3), (18, 22, 30), dtype=np.uint8)
     split_x = int(width * 0.58)
 
@@ -149,31 +143,42 @@ def render_3d_hawkeye_replay_frame(
             p2 = (round(float(w_pts[b, 0])), round(float(w_pts[b, 1])))
             cv2.line(left_panel, p1, p2, (248, 248, 248), line_thick, cv2.LINE_AA)
 
-    # Draw 3D ball trajectory arc and shadow in the zoom view
-    if len(traj_3d) >= 2:
-        vis_count = max(2, round(len(traj_3d) * min(1.0, s * 1.25)))
-        sub_traj = traj_3d[:vis_count]
-        shadow_3d = np.column_stack([sub_traj[:, 0], sub_traj[:, 1], np.zeros(len(sub_traj))])
+    # Draw projected ground path on court surface
+    if len(traj_court) >= 2:
+        vis_count = max(2, round(len(traj_court) * min(1.0, s * 1.25)))
+        sub_xy = traj_court[:vis_count]
+        sub_ground = (
+            sub_xy
+            if sub_xy.shape[1] == 3
+            else np.column_stack([sub_xy[:, 0], sub_xy[:, 1], np.zeros(len(sub_xy))])
+        )
+        shadow_3d = np.column_stack([sub_ground[:, 0], sub_ground[:, 1], np.zeros(len(sub_ground))])
         sh_2d = np.round(zoom_cam.project_3d_to_2d(shadow_3d)).astype(np.int32)
-        tr_2d = np.round(zoom_cam.project_3d_to_2d(sub_traj)).astype(np.int32)
+        tr_2d = np.round(zoom_cam.project_3d_to_2d(sub_ground)).astype(np.int32)
         for k in range(len(tr_2d) - 1):
             cv2.line(left_panel, tuple(sh_2d[k]), tuple(sh_2d[k + 1]), (85, 45, 12), 2, cv2.LINE_AA)
             cv2.line(left_panel, tuple(tr_2d[k]), tuple(tr_2d[k + 1]), (0, 235, 255), 3, cv2.LINE_AA)
 
-    # Draw elliptical bounce skid mark on the court surface
+    # Draw elliptical bounce skid mark on the court surface using actual footprint proportions
     b_pt_2d = zoom_cam.project_3d_to_2d(np.array([bx_m, by_m, 0.0], dtype=np.float64))
     b_px = (round(float(b_pt_2d[0])), round(float(b_pt_2d[1])))
-    skid_a = round(10 + 18 * smooth_s)
-    skid_b = round(6 + 10 * smooth_s)
-    cv2.ellipse(left_panel, b_px, (skid_a, skid_b), -15, 0, 360, (25, 28, 32), -1, cv2.LINE_AA)
-    cv2.ellipse(left_panel, b_px, (skid_a + 3, skid_b + 3), -15, 0, 360, (0, 255, 255), 2, cv2.LINE_AA)
+    if bounce_report is not None:
+        fp = bounce_report.decision.footprint
+        skid_a = max(6, round(fp.semi_major_m * 380.0 * (0.4 + 0.6 * smooth_s)))
+        skid_b = max(4, round(fp.semi_minor_m * 380.0 * (0.4 + 0.6 * smooth_s)))
+        az_deg = -float(np.rad2deg(fp.azimuth_rad))
+    else:
+        skid_a = round(10 + 14 * smooth_s)
+        skid_b = round(6 + 9 * smooth_s)
+        az_deg = 0.0
+    cv2.ellipse(left_panel, b_px, (skid_a, skid_b), az_deg, 0, 360, (25, 28, 32), -1, cv2.LINE_AA)
+    cv2.ellipse(left_panel, b_px, (skid_a + 3, skid_b + 3), az_deg, 0, 360, (0, 255, 255), 2, cv2.LINE_AA)
 
-    # Verdict Banner (Australian Open Hawk-Eye Live Broadcast Style)
-    verdict = bounce_report.decision.verdict if bounce_report is not None else "IN"
+    verdict = bounce_report.decision.verdict if bounce_report is not None else "N/A"
     is_in = bounce_report.decision.is_in if bounce_report is not None else True
-    margin_mm = abs(bounce_report.decision.margin_mm) if bounce_report is not None else 18.2
-    sigma_mm = bounce_report.decision.sigma_mm if bounce_report is not None else 2.1
-    line_name = bounce_report.decision.nearest_line_name if bounce_report is not None else "right_singles_sideline"
+    margin_mm = abs(bounce_report.decision.margin_mm) if bounce_report is not None else 0.0
+    sigma_mm = bounce_report.decision.sigma_mm if bounce_report is not None else 0.0
+    line_name = bounce_report.decision.nearest_line_name if bounce_report is not None else "court"
 
     banner_bg = (38, 165, 52) if is_in else (36, 42, 215)
     cv2.rectangle(left_panel, (24, 22), (split_x - 24, 114), (16, 20, 28), -1)
@@ -189,12 +194,13 @@ def render_3d_hawkeye_replay_frame(
         3,
         cv2.LINE_AA,
     )
+    replay_hdr = "MONOCULAR COURT-PLANE BOUNCE REPLAY" if is_monocular else "MULTI-VIEW 3D LINE CALL REPLAY"
     cv2.putText(
         left_panel,
-        "HAWK-EYE 3D CHALLENGE REPLAY",
+        replay_hdr,
         (195, 56),
         cv2.FONT_HERSHEY_DUPLEX,
-        0.72,
+        0.65,
         (120, 225, 255),
         2,
         cv2.LINE_AA,
@@ -212,9 +218,6 @@ def render_3d_hawkeye_replay_frame(
 
     canvas[:, :split_x] = left_panel
 
-    # -----------------------------------------------------------------------
-    # Right Panel: SEU 3D Isometric Wireframe Court Reconstruction Plot
-    # -----------------------------------------------------------------------
     right_w = width - split_x
     right_panel = np.full((height, right_w, 3), (248, 249, 252), dtype=np.uint8)
     iso_cam = build_lookat_camera(
@@ -225,7 +228,6 @@ def render_3d_hawkeye_replay_frame(
         fov_deg=38.0,
     )
 
-    # Draw black 3D wireframe court & net (matching SEU RECONSTRUCTION.py)
     iso_court_2d = iso_cam.project_3d_to_2d(WORLD_COORDINATES_3D)
     for group in SEU_WIREFRAME_GROUPS:
         for a, b in itertools.pairwise(group):
@@ -233,9 +235,13 @@ def render_3d_hawkeye_replay_frame(
             p2 = (round(float(iso_court_2d[b, 0])), round(float(iso_court_2d[b, 1])))
             cv2.line(right_panel, p1, p2, (30, 30, 30), 2, cv2.LINE_AA)
 
-    # Draw blue 3D trajectory points and green/red bounce marker
-    if len(traj_3d) > 0:
-        iso_traj_2d = iso_cam.project_3d_to_2d(traj_3d)
+    if len(traj_court) > 0:
+        pts_3d = (
+            traj_court
+            if traj_court.shape[1] == 3
+            else np.column_stack([traj_court[:, 0], traj_court[:, 1], np.full(len(traj_court), 0.0335)])
+        )
+        iso_traj_2d = iso_cam.project_3d_to_2d(pts_3d)
         vis_n = max(1, round(len(iso_traj_2d) * min(1.0, s * 1.25)))
         for k in range(vis_n):
             pt = (round(float(iso_traj_2d[k, 0])), round(float(iso_traj_2d[k, 1])))
@@ -247,30 +253,42 @@ def render_3d_hawkeye_replay_frame(
     cv2.circle(right_panel, b_iso_pt, 9, marker_col, -1, cv2.LINE_AA)
     cv2.circle(right_panel, b_iso_pt, 11, (20, 20, 20), 2, cv2.LINE_AA)
 
-    # Header & Legend matching SEU plot style
+    panel_hdr = (
+        "MONOCULAR Z=0 PROJECTION (NO DEPTH OBSERVATION)"
+        if is_monocular
+        else "MULTI-VIEW 3D TRAJECTORY (DLT + KNN + BALLISTIC)"
+    )
     cv2.putText(
         right_panel,
-        "3D TRAJECTORY RECONSTRUCTION (KNN + CONSTRAINED FIT)",
+        panel_hdr,
         (18, 38),
         cv2.FONT_HERSHEY_DUPLEX,
-        0.52,
+        0.48,
         (25, 30, 40),
         1,
         cv2.LINE_AA,
     )
     cv2.circle(right_panel, (32, 68), 6, (215, 70, 20), -1)
-    cv2.putText(right_panel, "3D Flight Arc (X,Y,Z)", (46, 73), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (40, 40, 40), 1)
-    cv2.circle(right_panel, (235, 68), 6, (35, 180, 45), -1)
-    cv2.putText(right_panel, "IN / Hit", (249, 73), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (40, 40, 40), 1)
-    cv2.circle(right_panel, (345, 68), 6, (30, 35, 230), -1)
-    cv2.putText(right_panel, "OUT", (359, 73), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (40, 40, 40), 1)
+    cv2.putText(
+        right_panel,
+        "Projected Ground Path (Z=0)" if is_monocular else "3D Flight Arc (X,Y,Z)",
+        (46, 73),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.44,
+        (40, 40, 40),
+        1,
+    )
+    cv2.circle(right_panel, (265, 68), 6, (35, 180, 45), -1)
+    cv2.putText(right_panel, "IN", (279, 73), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (40, 40, 40), 1)
+    cv2.circle(right_panel, (325, 68), 6, (30, 35, 230), -1)
+    cv2.putText(right_panel, "OUT", (339, 73), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (40, 40, 40), 1)
 
     cv2.putText(
         right_panel,
-        f"Bounce 3D: X={bx_m:.2f}m, Y={by_m:.2f}m, Z=0.03m",
+        f"Bounce Est: X={bx_m:.2f}m, Y={by_m:.2f}m (Z=0 plane)",
         (18, height - 22),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.52,
+        0.50,
         (35, 45, 60),
         1,
         cv2.LINE_AA,
@@ -315,7 +333,7 @@ def process_video(
     court_detector = CourtDetector()
     shot_segmenter = ShotSegmenter()
     detection_model = DetectionModel()
-    ball_detector = TrackNetMotionBallDetector()
+    ball_detector = ChromaMotionBallDetector()
     ball_kalman = BallKalmanTracker()
 
     raw_frames: list[NDArray[np.uint8]] = []
@@ -419,14 +437,18 @@ def process_video(
             peak_v_idx = max(active_indices, key=lambda idx: active_coords[idx][1])
             bounce_frame_indices = [peak_v_idx]
 
-    raw_3d = lift_2d_trajectory_to_3d_court(
+    court_xy_2d = project_2d_trajectory_to_court_plane(
         coords_2d=active_coords,
         game_warp_matrices=court_detector.game_warp_matrix,
-        bounce_frames=bounce_frame_indices,
         pixel_to_meters_fn=court_detector.court_reference.pixel_to_meters,
-        fps=fps,
     )
-    fitted_3d, _, _ = reconstruct_3d_trajectory_seu(raw_3d)
+
+    sx = ITF_COURT_LENGTH_M / 2374.0
+    sy = ITF_DOUBLES_WIDTH_M / 1093.0
+    m_ref_to_meters = np.array(
+        [[0.0, sx, -561.0 * sx], [sy, 0.0, -286.0 * sy], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
 
     bounce_reports: list[BounceEventReport] = []
     bounces_ref_history: dict[int, tuple[float, float, bool]] = {}
@@ -437,17 +459,22 @@ def process_video(
         ref_uv = apply_homography(inv_m, np.array([u_b, v_b], dtype=np.float64))
         xm, ym = court_detector.court_reference.pixel_to_meters(float(ref_uv[0]), float(ref_uv[1]))
 
-        # Estimate incident 3D velocity vector before bounce
         prev_idx = max(0, b_idx - 2)
         dt_b = max(1, b_idx - prev_idx) / max(fps, 1.0)
-        vx_m = float(raw_3d[b_idx, 0] - raw_3d[prev_idx, 0]) / dt_b
-        vy_m = float(raw_3d[b_idx, 1] - raw_3d[prev_idx, 1]) / dt_b
+        vx_m = float(court_xy_2d[b_idx, 0] - court_xy_2d[prev_idx, 0]) / dt_b
+        vy_m = float(court_xy_2d[b_idx, 1] - court_xy_2d[prev_idx, 1]) / dt_b
+        # Monocular Z=0 projection cannot observe Vz; use nominal impact speed & include parallax uncertainty
+        h_img_to_m = m_ref_to_meters @ inv_m
+        parallax_sigma_mm = monocular_parallax_bound_m(0.05, cam_ground_dist_m=18.0, cam_height_m=8.0) * 1000.0
         decision = evaluate_line_call(
             bounce_x_m=xm,
             bounce_y_m=ym,
             vel_incident_m_s=(vx_m, vy_m, -7.2),
             singles=True,
             use_skid_footprint=True,
+            homography_img_to_m=h_img_to_m,
+            bounce_uv_px=(u_b, v_b),
+            extra_sigma_mm=parallax_sigma_mm,
         )
         rep = BounceEventReport(
             frame_index=b_idx,
@@ -586,18 +613,19 @@ def process_video(
         writer.write(out_img)
         total_out_frames += 1
 
-    # Append 1.5s (45 frames) of 3D Hawk-Eye Challenge & SEU 3D Wireframe Replay when bounce == 1
-    if bounce == 1 and append_3d_replay and len(fitted_3d) >= 2:
+    # Append court-plane close-up replay when bounce == 1
+    if bounce == 1 and append_3d_replay and len(court_xy_2d) >= 2:
         primary_bounce = bounce_reports[-1] if bounce_reports else None
         replay_frames = max(18, round(fps * 1.2))
         for r_idx in range(replay_frames):
             prog = float(r_idx) / float(max(replay_frames - 1, 1))
-            replay_img = render_3d_hawkeye_replay_frame(
+            replay_img = render_court_replay_frame(
                 width=width,
                 height=height,
-                traj_3d=fitted_3d,
+                traj_court=court_xy_2d,
                 bounce_report=primary_bounce,
                 progress=prog,
+                is_monocular=True,
             )
             writer.write(replay_img)
             total_out_frames += 1
@@ -620,5 +648,5 @@ def process_video(
         cutaway_frames=cutaway_count,
         num_camera_shots=num_shots,
         bounces=bounce_reports,
-        trajectory_3d_m=[[round(float(v), 4) for v in pt] for pt in fitted_3d],
+        trajectory_court_xy_m=[[round(float(v), 4) for v in pt] for pt in court_xy_2d],
     )

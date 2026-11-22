@@ -15,7 +15,7 @@ from evaluation.predict_video import (
     BounceEventReport,
     VideoPredictionResult,
     process_video,
-    render_3d_hawkeye_replay_frame,
+    render_court_replay_frame,
 )
 from evaluation.synthetic_video import (
     SCENARIO_PRESETS,
@@ -40,9 +40,9 @@ __all__ = [
     "generate_synthetic_rally_video",
     "main",
     "process_video",
-    "render_3d_hawkeye_replay_frame",
     "render_benchmark_markdown",
     "render_court_3d_frame",
+    "render_court_replay_frame",
     "render_cutaway_frame",
     "run_benchmark",
     "run_single_benchmark_case",
