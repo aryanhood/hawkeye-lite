@@ -2,9 +2,12 @@
 
 ### Overview (What & Why)
 
-- **What it is:** A sports-vision geometry and physics engine inspired by the Hawk-Eye officiating system.
-- **Why I built it:** Many single-camera tennis projects claim to do automated line calling from a TV broadcast feed. I built this project to clearly separate what a **single broadcast camera** can actually do (court calibration, player/ball tracking, and a 2D minimap) from why **accurate `IN`/`OUT` line calling requires 2–4 calibrated cameras** to triangulate 3D depth and avoid meter-scale parallax errors.
-- **Key Result:** Tested across 300 noisy 2D-pixel scenarios, multi-camera 3D triangulation localizes ball bounces within **31.27 mm** (4 cameras) and **52.64 mm** (2 cameras), compared to **2,708 mm** error from a single camera. Modeling the ball's elliptical skid mark on impact adds **+6.61%** accuracy on tight line calls.
+- **Real-world problem:** Single-camera tennis apps often promise automated `IN`/`OUT` line calls from TV or phone video—but one camera cannot measure ball height off the ground, causing meter-scale depth errors (`~2.7 m`).
+- **What it does:** Calibrates court lines automatically, tracks players and rallies, reconstructs 3D ball bounces down to **31.27 mm** from 2–4 calibrated cameras (vs. **2,708 mm** from a single view), models the ball's elliptical impact skid mark (`+6.61%` tight-call accuracy), and ships with an interactive **3D Court & Benchmark Web Studio (`web/`)** ready for Vercel (`web/vercel.json`).
+
+```bash
+cd web && npm install && npm run check && npm run dev
+```
 
 | Input Broadcast Video (`.mp4`) | Annotated Output (`hawkeye-lite predict --minimap 1 --bounce 1`) |
 | :---: | :---: |
