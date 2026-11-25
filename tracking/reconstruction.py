@@ -597,8 +597,7 @@ def reconstruct_multiview_bounce(
                     inliers = [
                         c
                         for c in range(m_cams)
-                        if float(np.linalg.norm(_project_pt(p_now[c], cand) - np.array(uvs[c])))
-                        <= reproj_thresh_px
+                        if float(np.linalg.norm(_project_pt(p_now[c], cand) - np.array(uvs[c]))) <= reproj_thresh_px
                     ]
                     if len(inliers) > len(best_inliers):
                         best_inliers = inliers
@@ -615,10 +614,7 @@ def reconstruct_multiview_bounce(
                 raw_3d[k] = best_pt
         else:
             cand = triangulate_dlt(p_now, uvs)
-            errs = [
-                float(np.linalg.norm(_project_pt(p_now[c], cand) - np.array(uvs[c])))
-                for c in range(2)
-            ]
+            errs = [float(np.linalg.norm(_project_pt(p_now[c], cand) - np.array(uvs[c]))) for c in range(2)]
             if inside_range(cand) and float(cand[2]) >= -0.02 and max(errs) <= reproj_thresh_px:
                 raw_3d[k] = cand
 
@@ -648,9 +644,7 @@ def reconstruct_multiview_bounce(
 
     b_est = min(valid_idx, key=lambda idx: float(knn_src[idx, 2]))
     pre_idx = [idx for idx in range(max(0, b_est - 6), b_est) if float(np.linalg.norm(knn_src[idx])) > 1e-6]
-    post_idx = [
-        idx for idx in range(b_est + 1, min(n_steps, b_est + 7)) if float(np.linalg.norm(knn_src[idx])) > 1e-6
-    ]
+    post_idx = [idx for idx in range(b_est + 1, min(n_steps, b_est + 7)) if float(np.linalg.norm(knn_src[idx])) > 1e-6]
 
     dt = 1.0 / max(fps, 1.0)
     t_b_est = float(b_est) * dt

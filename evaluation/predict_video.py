@@ -148,9 +148,7 @@ def render_court_replay_frame(
         vis_count = max(2, round(len(traj_court) * min(1.0, s * 1.25)))
         sub_xy = traj_court[:vis_count]
         sub_ground = (
-            sub_xy
-            if sub_xy.shape[1] == 3
-            else np.column_stack([sub_xy[:, 0], sub_xy[:, 1], np.zeros(len(sub_xy))])
+            sub_xy if sub_xy.shape[1] == 3 else np.column_stack([sub_xy[:, 0], sub_xy[:, 1], np.zeros(len(sub_xy))])
         )
         shadow_3d = np.column_stack([sub_ground[:, 0], sub_ground[:, 1], np.zeros(len(sub_ground))])
         sh_2d = np.round(zoom_cam.project_3d_to_2d(shadow_3d)).astype(np.int32)

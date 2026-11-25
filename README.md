@@ -1,5 +1,7 @@
 # Hawk-Eye Lite — 3D Tennis Trajectory Reconstruction & Line Calling
 
+> **[Open Live 3D Court Studio](https://hawkeye-lite.vercel.app)** · **[Benchmark Report](docs/benchmark.md)** · **[Architecture](docs/architecture.md)**
+
 ### Overview (What & Why)
 
 - **Real-world problem:** Single-camera tennis apps often promise automated `IN`/`OUT` line calls from TV or phone video—but one camera cannot measure ball height off the ground, causing meter-scale depth errors (`~2.7 m`).

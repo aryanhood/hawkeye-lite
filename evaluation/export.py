@@ -168,9 +168,7 @@ def build_web_studio_payload(report: BenchmarkReport) -> dict[str, object]:
                 "nearest_line": decision.nearest_line_name,
                 "raw_points_3d": [[round(float(v), 3) for v in pt] for pt in mv.raw_points_3d],
                 "knn_points_3d": [
-                    [round(float(v), 3) for v in pt]
-                    for pt in mv.knn_points_3d
-                    if float(np.linalg.norm(pt)) > 1e-6
+                    [round(float(v), 3) for v in pt] for pt in mv.knn_points_3d if float(np.linalg.norm(pt)) > 1e-6
                 ],
                 "fitted_curve_3d": [[round(float(v), 3) for v in pt] for pt in fitted_3d],
                 "ground_truth_3d": [[round(float(v), 3) for v in pt] for pt in traj_gt],
@@ -220,10 +218,7 @@ def export_all(repo_root: str | Path, check_only: bool = False) -> bool:
             return False
         current_md = md_path.read_text(encoding="utf-8").replace("\r\n", "\n")
         current_json = json_path.read_text(encoding="utf-8").replace("\r\n", "\n")
-        return (
-            current_md == md_content.replace("\r\n", "\n")
-            and current_json == json_content.replace("\r\n", "\n")
-        )
+        return current_md == md_content.replace("\r\n", "\n") and current_json == json_content.replace("\r\n", "\n")
 
     md_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.parent.mkdir(parents=True, exist_ok=True)
